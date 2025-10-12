@@ -32,11 +32,17 @@ def parse_args():
     gen_parser.add_argument("--sample_prob", default=0.1, type=float, help="Frame sampling probability [0-1]")
     gen_parser.add_argument("--splits", nargs=3, default=[0.7, 0.2, 0.1], type=float, help="Train/val/test split ratios")
     gen_parser.add_argument("--imgsz", default=1280, type=int, help="Resize frames before YOLO inference")
+    gen_parser.add_argument(
+        "--segments",
+        nargs="+",
+        default=None,
+        help="List of video segments in start:end (minutes) format, e.g. 5:10 15:25 60:65"
+    )
 
     # --- VISUALIZE DATASET ---
     vis_parser = subparsers.add_parser("visualize", help="Visualize YOLO-format dataset bounding boxes")
     vis_parser.add_argument("--dataset", required=True, type=str, help="Path to YOLO dataset folder")
-    vis_parser.add_argument("--split", default="train", choices=["train", "val", "test"], help="Dataset split to visualize")
+    vis_parser.add_argument("--split", default="train", choices=["train", "val", "test", "valid"], help="Dataset split to visualize")
     vis_parser.add_argument("--max_images", default=5, type=int, help="Maximum number of random images to show")
     vis_parser.add_argument("--save_dir", default=None, type=str, help="Directory to save visualizations instead of displaying")
 
@@ -70,6 +76,20 @@ def run_train(args):
 
 def run_generate(args):
     logger = setup_logger("DatasetCreator")
+
+    # Parse --segments (convert ["5:10", "15:25"] → [(5.0, 10.0), (15.0, 25.0)])
+    segments = None
+    if args.segments:
+        segments = []
+        for seg in args.segments:
+            try:
+                start, end = map(float, seg.split(":"))
+                if end <= start:
+                    raise ValueError
+                segments.append((start, end))
+            except Exception:
+                raise ValueError(f"Invalid segment format '{seg}'. Expected start:end in minutes (e.g. 5:10).")
+
     creator = DatasetCreator(
         model_path=args.model,
         output_dir=args.output,
@@ -78,7 +98,8 @@ def run_generate(args):
         imgsz=args.imgsz,
         logger=logger
     )
-    creator.create_from_video(args.video)
+
+    creator.create_from_video(args.video, segments=segments)
 
 
 def run_visualize(args):

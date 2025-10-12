@@ -1,15 +1,11 @@
 import cv2
 import random
 import tempfile
+import subprocess
 from pathlib import Path
-from typing import Union
+from typing import Union, List, Tuple
 from ultralytics import YOLO
 from .config import setup_logger
-
-try:
-    from pytube import YouTube
-except ImportError:
-    YouTube = None
 
 
 class DatasetCreator:
@@ -17,6 +13,7 @@ class DatasetCreator:
     Generate a YOLO-format dataset automatically using a trained YOLO model.
 
     - Accepts local video paths or YouTube URLs.
+    - Can process specific time segments (start:end in minutes).
     - Samples frames probabilistically to limit dataset size.
     - Saves predictions in YOLO format.
     - Automatically creates the dataset structure and YAML file.
@@ -35,7 +32,7 @@ class DatasetCreator:
         Args:
             model_path: Path to YOLO weights (e.g., 'runs/train/best.pt').
             output_dir: Root directory where dataset will be created.
-            sample_prob: Probability to keep a given frame (0–1).
+            sample_prob: Probability to keep a given frame (0-1).
             splits: Train/val/test ratio tuple (must sum to 1).
             imgsz: Resize frames before inference (e.g., 640, 1280).
             logger: Optional logger instance; defaults to setup_logger().
@@ -57,13 +54,16 @@ class DatasetCreator:
             (self.output_dir / "labels" / split).mkdir(parents=True, exist_ok=True)
 
     def _download_youtube(self, url: str) -> Path:
-        """Download a YouTube video to a temporary file."""
-        if YouTube is None:
-            raise ImportError("pytube is required for YouTube downloads. Install via `pip install pytube`.")
-        yt = YouTube(url)
-        stream = yt.streams.filter(progressive=True, file_extension="mp4").order_by("resolution").desc().first()
+        """Download a YouTube video to a temporary file using yt-dlp."""
         tmp_dir = Path(tempfile.mkdtemp())
-        out_path = Path(stream.download(output_path=tmp_dir))
+        out_path = tmp_dir / "video.mp4"
+        cmd = ["yt-dlp", "-f", "mp4", "-o", str(out_path), url]
+        try:
+            subprocess.run(cmd, check=True, capture_output=True)
+        except subprocess.CalledProcessError as e:
+            raise RuntimeError(
+                f"Failed to download YouTube video: {url}\n{e.stderr.decode()}"
+            )
         self.logger.info(f"Downloaded YouTube video to {out_path}")
         return out_path
 
@@ -84,14 +84,19 @@ class DatasetCreator:
                 xywhn = box.xywhn.view(-1).tolist()
                 f.write(f"{cls} {' '.join(f'{x:.6f}' for x in xywhn)}\n")
 
-    def create_from_video(self, video_source: Union[str, Path]):
+    def create_from_video(
+        self,
+        video_source: Union[str, Path],
+        segments: List[Tuple[float, float]] = None,
+    ):
         """
         Generate dataset from a local video or YouTube URL.
+        You can restrict processing to specific segments.
 
         Args:
             video_source: Path to a local video file or a YouTube URL.
+            segments: Optional list of (start_min, end_min) tuples specifying which parts of the video to process.
         """
-        # Download if YouTube URL
         if isinstance(video_source, str) and video_source.startswith("http"):
             video_source = self._download_youtube(video_source)
 
@@ -100,45 +105,57 @@ class DatasetCreator:
         if not cap.isOpened():
             raise FileNotFoundError(f"Cannot open video: {video_source}")
 
+        fps = cap.get(cv2.CAP_PROP_FPS)
         total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
-        self.logger.info(f"Processing video: {video_source.name} ({total_frames} frames)")
+        duration_sec = total_frames / fps if fps > 0 else 0
+        self.logger.info(
+            f"Processing video: {video_source.name} | {total_frames} frames | {duration_sec/60:.1f} min | {fps:.2f} FPS"
+        )
+
+        if not segments:
+            segments = [(0, duration_sec / 60)]  # default: whole video
 
         frame_idx, saved = 0, 0
 
-        while True:
-            ret, frame = cap.read()
-            if not ret:
-                break
+        for (start_min, end_min) in segments:
+            start_frame = int(start_min * 60 * fps)
+            end_frame = int(end_min * 60 * fps)
+            end_frame = min(end_frame, total_frames - 1)
 
-            frame_idx += 1
-            if random.random() > self.sample_prob:
-                continue  # skip this frame
+            cap.set(cv2.CAP_PROP_POS_FRAMES, start_frame)
+            self.logger.info(f"Processing segment {start_min:.2f}–{end_min:.2f} min ({start_frame}-{end_frame} frames)")
 
-            # Resize frame before prediction (keeps aspect ratio)
-            frame_resized = cv2.resize(frame, (self.imgsz, self.imgsz), interpolation=cv2.INTER_LINEAR)
+            while cap.get(cv2.CAP_PROP_POS_FRAMES) <= end_frame:
+                ret, frame = cap.read()
+                if not ret:
+                    break
 
-            results = self.model.predict(frame_resized, imgsz=self.imgsz, verbose=False)
-            boxes = results[0].boxes
-            if not boxes or len(boxes) == 0:
-                continue
+                frame_idx = int(cap.get(cv2.CAP_PROP_POS_FRAMES))
+                if random.random() > self.sample_prob:
+                    continue
 
-            split = self._choose_split()
-            img_dir = self.output_dir / "images" / split
-            label_dir = self.output_dir / "labels" / split
+                frame_resized = cv2.resize(frame, (self.imgsz, self.imgsz), interpolation=cv2.INTER_LINEAR)
+                results = self.model.predict(frame_resized, imgsz=self.imgsz, verbose=False)
+                boxes = results[0].boxes
+                if not boxes or len(boxes) == 0:
+                    continue
 
-            img_name = f"{video_source.stem}_{frame_idx:06d}.jpg"
-            label_name = img_name.replace(".jpg", ".txt")
+                split = self._choose_split()
+                img_dir = self.output_dir / "images" / split
+                label_dir = self.output_dir / "labels" / split
 
-            img_path = img_dir / img_name
-            label_path = label_dir / label_name
+                img_name = f"{video_source.stem}_{frame_idx:06d}.jpg"
+                label_name = img_name.replace(".jpg", ".txt")
 
-            # Save original (non-resized) frame for realism
-            cv2.imwrite(str(img_path), frame)
-            self._save_label_file(label_path, boxes)
-            saved += 1
+                img_path = img_dir / img_name
+                label_path = label_dir / label_name
 
-            if saved % 50 == 0:
-                self.logger.info(f"Saved {saved} labeled frames so far...")
+                cv2.imwrite(str(img_path), frame)
+                self._save_label_file(label_path, boxes)
+                saved += 1
+
+                if saved % 50 == 0:
+                    self.logger.info(f"Saved {saved} labeled frames so far...")
 
         cap.release()
         self.logger.info(f"Dataset generation complete. Total labeled frames: {saved}")
@@ -157,7 +174,7 @@ class DatasetCreator:
             "train: images/train",
             "val: images/val",
             "test: images/test",
-            "names:"
+            "names:",
         ]
         lines += [f"  {i}: {name}" for i, name in names.items()]
 
