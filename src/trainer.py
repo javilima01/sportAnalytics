@@ -1,7 +1,7 @@
 from torch.utils.tensorboard import SummaryWriter
 from ultralytics import YOLO
-from src.models import TrainConfig
-from src.config import setup_logger
+from .models import TrainConfig
+from .config import setup_logger
 
 
 class YOLOFineTuner:
@@ -10,17 +10,17 @@ class YOLOFineTuner:
     def __init__(self, cfg: TrainConfig):
         self.cfg = cfg
         self.logger = setup_logger(name="YOLOTrainer")
-        self.model = YOLO(cfg.model_ckpt)
+        self.model = YOLO(cfg.model)
         self.writer = SummaryWriter(log_dir=cfg.tensorboard_dir)
 
     def train(self):
         """Fine-tune YOLO model using configuration values."""
-        self.logger.info(f"Starting fine-tuning: {self.cfg.model_ckpt}")
+        self.logger.info(f"Starting fine-tuning: {self.cfg.model}")
 
         # Dump config and remove non-YOLO keys before passing
         params = self.cfg.model_dump()
         # remove non-arg fields that YOLO.train() doesn’t use
-        for key in ["model_ckpt", "export_format", "tensorboard_dir"]:
+        for key in ["model", "export_format", "tensorboard_dir"]:
             params.pop(key, None)
 
         results = self.model.train(**params)
@@ -36,7 +36,7 @@ class YOLOFineTuner:
         """Run validation on the validation split."""
         self.logger.info("Running validation...")
         metrics = self.model.val(
-            data=self.cfg.data_yaml,
+            data=self.cfg.data,
             imgsz=self.cfg.imgsz,
             device=self.cfg.device
         )
