@@ -4,6 +4,8 @@ import tempfile
 import subprocess
 from pathlib import Path
 from typing import Union, List, Tuple
+import torch
+import onnxruntime as ort
 from ultralytics import YOLO
 from .config import setup_logger
 
@@ -11,12 +13,6 @@ from .config import setup_logger
 class DatasetCreator:
     """
     Generate a YOLO-format dataset automatically using a trained YOLO model.
-
-    - Accepts local video paths or YouTube URLs.
-    - Can process specific time segments (start:end in minutes).
-    - Samples frames probabilistically to limit dataset size.
-    - Saves predictions in YOLO format.
-    - Automatically creates the dataset structure and YAML file.
     """
 
     def __init__(
@@ -28,33 +24,54 @@ class DatasetCreator:
         imgsz: int = 1280,
         logger=None,
     ):
-        """
-        Args:
-            model_path: Path to YOLO weights (e.g., 'runs/train/best.pt').
-            output_dir: Root directory where dataset will be created.
-            sample_prob: Probability to keep a given frame (0-1).
-            splits: Train/val/test ratio tuple (must sum to 1).
-            imgsz: Resize frames before inference (e.g., 640, 1280).
-            logger: Optional logger instance; defaults to setup_logger().
-        """
-        self.model = YOLO(str(model_path))
+        self.logger = logger or setup_logger("DatasetCreator")
+        self.model_path = Path(model_path)
+        self.model_type = self.model_path.suffix.lower().replace('.', '')
+        self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        self.model = self.load_model(self.model_path)
+
         self.output_dir = Path(output_dir)
         self.sample_prob = sample_prob
         self.splits = splits
         self.imgsz = imgsz
-        self.logger = logger or setup_logger("DatasetCreator")
 
-        self.logger.info(f"Loaded YOLO model: {model_path}")
+        self.logger.info(f"Loaded model on {self.device}: {model_path}")
         self._prepare_folders()
 
+    def load_model(self, model_path: Union[str, Path]):
+        model_path = Path(model_path)
+        ext = model_path.suffix.lower()
+
+        if ext == ".pt":
+            try:
+                model = YOLO(str(model_path))
+                model.to(self.device)
+                self.logger.info("Loaded YOLO model (.pt)")
+                return model
+            except Exception:
+                self.logger.info("Detected quantized PyTorch model (.pt)")
+                state_dict = torch.load(model_path, map_location=self.device)
+                dummy_model = YOLO("yolov8n.pt").model
+                dummy_model.load_state_dict(state_dict, strict=False)
+                dummy_model.to(self.device)
+                dummy_model.eval()
+                return dummy_model
+
+        elif ext == ".onnx":
+            providers = ["CUDAExecutionProvider", "CPUExecutionProvider"] if torch.cuda.is_available() else ["CPUExecutionProvider"]
+            self.logger.info(f"Loaded ONNX model (.onnx) with providers: {providers}")
+            session = ort.InferenceSession(str(model_path), providers=providers)
+            return session
+
+        else:
+            raise ValueError(f"Unsupported model type: {ext}")
+
     def _prepare_folders(self):
-        """Create folder structure for YOLO dataset."""
         for split in ["train", "val", "test"]:
             (self.output_dir / "images" / split).mkdir(parents=True, exist_ok=True)
             (self.output_dir / "labels" / split).mkdir(parents=True, exist_ok=True)
 
     def _download_youtube(self, url: str) -> Path:
-        """Download a YouTube video to a temporary file using yt-dlp."""
         tmp_dir = Path(tempfile.mkdtemp())
         out_path = tmp_dir / "video.mp4"
         cmd = ["yt-dlp", "-f", "mp4", "-o", str(out_path), url]
@@ -68,7 +85,6 @@ class DatasetCreator:
         return out_path
 
     def _choose_split(self) -> str:
-        """Randomly assign a frame to train, val, or test split."""
         r = random.random()
         if r < self.splits[0]:
             return "train"
@@ -77,7 +93,6 @@ class DatasetCreator:
         return "test"
 
     def _save_label_file(self, label_path: Path, boxes):
-        """Write YOLO-format label file for one image."""
         with label_path.open("w") as f:
             for box in boxes:
                 cls = int(box.cls)
@@ -89,14 +104,6 @@ class DatasetCreator:
         video_source: Union[str, Path],
         segments: List[Tuple[float, float]] = None,
     ):
-        """
-        Generate dataset from a local video or YouTube URL.
-        You can restrict processing to specific segments.
-
-        Args:
-            video_source: Path to a local video file or a YouTube URL.
-            segments: Optional list of (start_min, end_min) tuples specifying which parts of the video to process.
-        """
         if isinstance(video_source, str) and video_source.startswith("http"):
             video_source = self._download_youtube(video_source)
 
@@ -113,7 +120,7 @@ class DatasetCreator:
         )
 
         if not segments:
-            segments = [(0, duration_sec / 60)]  # default: whole video
+            segments = [(0, duration_sec / 60)]
 
         frame_idx, saved = 0, 0
 
@@ -135,8 +142,8 @@ class DatasetCreator:
                     continue
 
                 frame_resized = cv2.resize(frame, (self.imgsz, self.imgsz), interpolation=cv2.INTER_LINEAR)
-                results = self.model.predict(frame_resized, imgsz=self.imgsz, verbose=False)
-                boxes = results[0].boxes
+                results = self._run_inference(frame_resized)
+                boxes = results if isinstance(results, list) else results[0].boxes
                 if not boxes or len(boxes) == 0:
                     continue
 
@@ -164,10 +171,31 @@ class DatasetCreator:
         self.logger.info(f"Dataset YAML created at {yaml_path}")
         return self.output_dir
 
+    def _run_inference(self, frame):
+        if self.model_type == "onnx":
+            img = frame.transpose(2, 0, 1)
+            img = img[None].astype("float32") / 255.0
+            ort_inputs = {self.model.get_inputs()[0].name: img}
+            return self.model.run(None, ort_inputs)
+        elif isinstance(self.model, YOLO):
+            return self.model.predict(frame, imgsz=self.imgsz, device=str(self.device), verbose=False)
+        else:
+            with torch.no_grad():
+                tensor = (
+                    torch.from_numpy(frame)
+                    .permute(2, 0, 1)
+                    .unsqueeze(0)
+                    .float()
+                    .to(self.device)
+                    / 255.0
+                )
+                return self.model(tensor)
+
     def _write_yaml(self) -> Path:
-        """Write the YOLO dataset YAML file."""
         yaml_path = self.output_dir / "data.yaml"
-        names = self.model.names
+        names = getattr(self.model, "names", None)
+        if not names:
+            names = {0: "object"}
 
         lines = [
             f"path: {self.output_dir}",
@@ -177,6 +205,5 @@ class DatasetCreator:
             "names:",
         ]
         lines += [f"  {i}: {name}" for i, name in names.items()]
-
         yaml_path.write_text("\n".join(lines))
         return yaml_path

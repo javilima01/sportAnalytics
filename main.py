@@ -11,8 +11,8 @@ def parse_args():
 
     subparsers = parser.add_subparsers(dest="command", required=True, help="Command: train, generate, or visualize")
 
-    # --- TRAIN ---
-    train_parser = subparsers.add_parser("train", help="Fine-tune a YOLOv8 model")
+    # --- TRAIN / EXPORT ---
+    train_parser = subparsers.add_parser("train", help="Train or export a YOLOv8 model")
     train_parser.add_argument("--data", required=True, type=str, help="Path to dataset YAML")
     train_parser.add_argument("--model", default="yolov8x.pt", type=str, help="Model checkpoint or name")
     train_parser.add_argument("--epochs", default=50, type=int, help="Number of training epochs")
@@ -23,6 +23,12 @@ def parse_args():
     train_parser.add_argument("--device", default="0", type=str, help="Device index (e.g. '0' or 'cpu')")
     train_parser.add_argument("--patience", default=100, type=int, help="Early stopping patience")
     train_parser.add_argument("--workers", default=8, type=int, help="Number of dataloader workers")
+    train_parser.add_argument("--skip_train", action="store_true", help="Skip training and only export/validate the model")
+
+    # Export-related arguments
+    train_parser.add_argument("--export_onnx", action="store_true", help="Export model to ONNX format")
+    train_parser.add_argument("--export_quantized", action="store_true", help="Export model as quantized")
+    train_parser.add_argument("--export_pruned", action="store_true", help="Prune model before export")
 
     # --- GENERATE DATASET ---
     gen_parser = subparsers.add_parser("generate", help="Generate a YOLO-format dataset using a trained model")
@@ -39,11 +45,11 @@ def parse_args():
         help="List of video segments in start:end (minutes) format, e.g. 5:10 15:25 60:65"
     )
 
-    # --- VISUALIZE / EDIT DATASET ---
+    # --- VISUALIZE ---
     vis_parser = subparsers.add_parser("visualize", help="Visualize or edit YOLO-format dataset bounding boxes")
     vis_parser.add_argument("--dataset", required=True, type=str, help="Path to YOLO dataset folder")
     vis_parser.add_argument("--split", default="train", choices=["train", "val", "test", "valid"], help="Dataset split to visualize")
-    vis_parser.add_argument("--max_images", default=5, type=int, help="Maximum number of random images to show (view mode only)")
+    vis_parser.add_argument("--max_images", default=5, type=int, help="Maximum number of random images to show")
     vis_parser.add_argument("--save_dir", default=None, type=str, help="Directory to save visualizations instead of displaying")
     vis_parser.add_argument("--edit", action="store_true", help="Open interactive label editor")
 
@@ -69,8 +75,28 @@ def run_train(args):
     for k, v in cfg.model_dump().items():
         trainer.logger.info(f"  {k}: {v}")
 
-    trainer.train()
-    trainer.validate()
+    if not args.skip_train:
+        trainer.logger.info("Starting training process...")
+        trainer.train()
+    else:
+        trainer.logger.info("Skipping training — using provided model weights.")
+
+    if args.export_pruned:
+        trainer.logger.info("Applying pruning before export...")
+        trainer.prune()
+
+    if args.export_quantized:
+        trainer.logger.info("Exporting quantized model...")
+        trainer.export_quantized()
+
+    if args.export_onnx:
+        trainer.logger.info("Exporting ONNX model...")
+        trainer.export_onnx()
+
+    trainer.logger.info("Running validation after export or training...")
+    metrics = trainer.validate()
+    trainer.logger.info(f"Final validation metrics: {metrics}")
+
     trainer.export_best()
     trainer.close()
 

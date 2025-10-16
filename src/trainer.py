@@ -1,11 +1,13 @@
 from torch.utils.tensorboard import SummaryWriter
 from ultralytics import YOLO
+import torch
+import torch.nn.utils.prune as prune
 from .models import TrainConfig
 from .config import setup_logger
 
 
 class YOLOFineTuner:
-    """Encapsulates YOLOv8 fine-tuning, validation, and export."""
+    """Encapsulates YOLOv8 fine-tuning, validation, pruning, quantization, and export."""
 
     def __init__(self, cfg: TrainConfig):
         self.cfg = cfg
@@ -17,9 +19,7 @@ class YOLOFineTuner:
         """Fine-tune YOLO model using configuration values."""
         self.logger.info(f"Starting fine-tuning: {self.cfg.model}")
 
-        # Dump config and remove non-YOLO keys before passing
         params = self.cfg.model_dump()
-        # remove non-arg fields that YOLO.train() doesn’t use
         for key in ["model", "export_format", "tensorboard_dir"]:
             params.pop(key, None)
 
@@ -46,6 +46,38 @@ class YOLOFineTuner:
         self.writer.flush()
         self.logger.info("Validation completed.")
         return metrics
+
+    def prune(self, amount: float = 0.3):
+        """Prunes model parameters by a given amount."""
+        self.logger.info(f"Pruning model with amount={amount}")
+        torch_model = self.model.model
+        for name, module in torch_model.named_modules():
+            if isinstance(module, torch.nn.Conv2d) or isinstance(module, torch.nn.Linear):
+                prune.l1_unstructured(module, name="weight", amount=amount)
+                prune.remove(module, "weight")
+        self.logger.info("Model pruning completed.")
+
+    def export_quantized(self, output_dir: str = None):
+        """Exports the model in a quantized form."""
+        self.logger.info("Exporting quantized model...")
+        if output_dir is None:
+            output_dir = f"{self.cfg.save_dir}/weights/quantized.pt"
+
+        quantized_model = torch.quantization.quantize_dynamic(
+            self.model.model, {torch.nn.Linear, torch.nn.Conv2d}, dtype=torch.qint8
+        )
+        torch.save(quantized_model.state_dict(), output_dir)
+        self.logger.info(f"Quantized model saved at: {output_dir}")
+        return output_dir
+
+    def export_onnx(self, output_path: str = None):
+        """Exports the model to ONNX format."""
+        self.logger.info("Exporting model to ONNX format...")
+        if output_path is None:
+            output_path = f"{self.cfg.save_dir}/weights/model.onnx"
+        self.model.export(format="onnx", opset=12, dynamic=True, simplify=True)
+        self.logger.info(f"ONNX model exported to: {output_path}")
+        return output_path
 
     def export_best(self):
         """Export best weights to chosen format."""
