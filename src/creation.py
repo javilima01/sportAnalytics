@@ -1,209 +1,205 @@
-import cv2
+"""Create reviewable YOLO detection datasets from videos."""
+
+import hashlib
+import math
 import random
-import tempfile
+import shutil
 import subprocess
+import sys
+import tempfile
 from pathlib import Path
-from typing import Union, List, Tuple
-import torch
-import onnxruntime as ort
+
+import cv2
+import yaml
 from ultralytics import YOLO
+
 from .config import setup_logger
+from .dataset import SPLITS, atomic_write, class_names, read_names
 
 
 class DatasetCreator:
-    """
-    Generate a YOLO-format dataset automatically using a trained YOLO model.
-    """
-
     def __init__(
         self,
-        model_path: Union[str, Path],
-        output_dir: Union[str, Path] = "datasets/generated_dataset",
-        sample_prob: float = 0.1,
-        splits: tuple[float, float, float] = (0.7, 0.2, 0.1),
-        imgsz: int = 1280,
+        model_path,
+        output_dir="datasets/generated_dataset",
+        sample_prob=0.1,
+        splits=(0.7, 0.2, 0.1),
+        imgsz=1280,
         logger=None,
+        conf=0.25,
+        device=None,
+        seed=0,
+        include_empty=False,
     ):
+        if not math.isfinite(sample_prob) or not 0 <= sample_prob <= 1:
+            raise ValueError("sample_prob must be between 0 and 1.")
+        if (
+            len(splits) != 3
+            or any(not math.isfinite(v) or v < 0 for v in splits)
+            or not math.isclose(sum(splits), 1)
+        ):
+            raise ValueError("splits must contain three nonnegative ratios summing to 1.")
+        if imgsz < 32:
+            raise ValueError("imgsz must be at least 32.")
+        if not math.isfinite(conf) or not 0 <= conf <= 1:
+            raise ValueError("conf must be between 0 and 1.")
+        if Path(model_path).suffix.lower() != ".pt":
+            raise ValueError("Image tagging requires a YOLO .pt checkpoint.")
         self.logger = logger or setup_logger("DatasetCreator")
-        self.model_path = Path(model_path)
-        self.model_type = self.model_path.suffix.lower().replace('.', '')
-        self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-        self.model = self.load_model(self.model_path)
-
         self.output_dir = Path(output_dir)
-        self.sample_prob = sample_prob
-        self.splits = splits
-        self.imgsz = imgsz
+        self.sample_prob, self.splits, self.imgsz = sample_prob, splits, imgsz
+        self.conf, self.device, self.include_empty = conf, device, include_empty
+        self.random = random.Random(seed)
+        self.model = YOLO(str(model_path))
+        if self.model.task != "detect":
+            raise ValueError("Image tagging requires a detection model.")
+        self.names = class_names(self.model.names)
+        yaml_path = self.output_dir / "data.yaml"
+        if yaml_path.exists() and read_names(yaml_path) != self.names:
+            raise ValueError("Existing dataset class names differ from the model.")
+        for split in SPLITS:
+            for kind in ("images", "labels"):
+                (self.output_dir / kind / split).mkdir(parents=True, exist_ok=True)
+        self._write_yaml()
 
-        self.logger.info(f"Loaded model on {self.device}: {model_path}")
-        self._prepare_folders()
-
-    def load_model(self, model_path: Union[str, Path]):
-        model_path = Path(model_path)
-        ext = model_path.suffix.lower()
-
-        if ext == ".pt":
-            try:
-                model = YOLO(str(model_path))
-                model.to(self.device)
-                self.logger.info("Loaded YOLO model (.pt)")
-                return model
-            except Exception:
-                self.logger.info("Detected quantized PyTorch model (.pt)")
-                state_dict = torch.load(model_path, map_location=self.device)
-                dummy_model = YOLO("yolov8n.pt").model
-                dummy_model.load_state_dict(state_dict, strict=False)
-                dummy_model.to(self.device)
-                dummy_model.eval()
-                return dummy_model
-
-        elif ext == ".onnx":
-            providers = ["CUDAExecutionProvider", "CPUExecutionProvider"] if torch.cuda.is_available() else ["CPUExecutionProvider"]
-            self.logger.info(f"Loaded ONNX model (.onnx) with providers: {providers}")
-            session = ort.InferenceSession(str(model_path), providers=providers)
-            return session
-
-        else:
-            raise ValueError(f"Unsupported model type: {ext}")
-
-    def _prepare_folders(self):
-        for split in ["train", "val", "test"]:
-            (self.output_dir / "images" / split).mkdir(parents=True, exist_ok=True)
-            (self.output_dir / "labels" / split).mkdir(parents=True, exist_ok=True)
-
-    def _download_youtube(self, url: str) -> Path:
-        tmp_dir = Path(tempfile.mkdtemp())
-        out_path = tmp_dir / "video.mp4"
-        cmd = ["yt-dlp", "-f", "mp4", "-o", str(out_path), url]
-        try:
-            subprocess.run(cmd, check=True, capture_output=True)
-        except subprocess.CalledProcessError as e:
-            raise RuntimeError(
-                f"Failed to download YouTube video: {url}\n{e.stderr.decode()}"
-            )
-        self.logger.info(f"Downloaded YouTube video to {out_path}")
-        return out_path
-
-    def _choose_split(self) -> str:
-        r = random.random()
-        if r < self.splits[0]:
-            return "train"
-        elif r < self.splits[0] + self.splits[1]:
-            return "val"
-        return "test"
-
-    def _save_label_file(self, label_path: Path, boxes):
-        with label_path.open("w") as f:
-            for box in boxes:
-                cls = int(box.cls)
-                xywhn = box.xywhn.view(-1).tolist()
-                f.write(f"{cls} {' '.join(f'{x:.6f}' for x in xywhn)}\n")
-
-    def create_from_video(
-        self,
-        video_source: Union[str, Path],
-        segments: List[Tuple[float, float]] = None,
-    ):
-        if isinstance(video_source, str) and video_source.startswith("http"):
-            video_source = self._download_youtube(video_source)
-
-        video_source = Path(video_source)
-        cap = cv2.VideoCapture(str(video_source))
-        if not cap.isOpened():
-            raise FileNotFoundError(f"Cannot open video: {video_source}")
-
-        fps = cap.get(cv2.CAP_PROP_FPS)
-        total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
-        duration_sec = total_frames / fps if fps > 0 else 0
-        self.logger.info(
-            f"Processing video: {video_source.name} | {total_frames} frames | {duration_sec/60:.1f} min | {fps:.2f} FPS"
+    def _download_youtube(self, url, directory):
+        output = Path(directory) / "video.mp4"
+        # Find the runtime beside Python even when the virtualenv is not activated.
+        runtime = shutil.which("deno", path=str(Path(sys.executable).parent)) or shutil.which(
+            "deno"
         )
+        if runtime is None:
+            raise RuntimeError("YouTube downloading requires Deno. Install requirements.txt first.")
+        command = [
+            sys.executable,
+            "-m",
+            "yt_dlp",
+            "--no-playlist",
+            "--js-runtimes",
+            f"deno:{runtime}",
+            "-f",
+            # No audio/merging is needed; prefer H.264 for OpenCV compatibility.
+            "bestvideo[ext=mp4][vcodec^=avc1]/best[ext=mp4]/bestvideo[ext=mp4]",
+            "-o",
+            str(output),
+            url,
+        ]
+        try:
+            subprocess.run(command, check=True, capture_output=True, text=True)
+        except subprocess.CalledProcessError as error:
+            raise RuntimeError(f"Video download failed: {error.stderr}") from error
+        return output
 
-        if not segments:
-            segments = [(0, duration_sec / 60)]
-
-        frame_idx, saved = 0, 0
-
-        for (start_min, end_min) in segments:
-            start_frame = int(start_min * 60 * fps)
-            end_frame = int(end_min * 60 * fps)
-            end_frame = min(end_frame, total_frames - 1)
-
-            cap.set(cv2.CAP_PROP_POS_FRAMES, start_frame)
-            self.logger.info(f"Processing segment {start_min:.2f}–{end_min:.2f} min ({start_frame}-{end_frame} frames)")
-
-            while cap.get(cv2.CAP_PROP_POS_FRAMES) <= end_frame:
-                ret, frame = cap.read()
-                if not ret:
-                    break
-
-                frame_idx = int(cap.get(cv2.CAP_PROP_POS_FRAMES))
-                if random.random() > self.sample_prob:
-                    continue
-
-                frame_resized = cv2.resize(frame, (self.imgsz, self.imgsz), interpolation=cv2.INTER_LINEAR)
-                results = self._run_inference(frame_resized)
-                boxes = results if isinstance(results, list) else results[0].boxes
-                if not boxes or len(boxes) == 0:
-                    continue
-
-                split = self._choose_split()
-                img_dir = self.output_dir / "images" / split
-                label_dir = self.output_dir / "labels" / split
-
-                img_name = f"{video_source.stem}_{frame_idx:06d}.jpg"
-                label_name = img_name.replace(".jpg", ".txt")
-
-                img_path = img_dir / img_name
-                label_path = label_dir / label_name
-
-                cv2.imwrite(str(img_path), frame)
-                self._save_label_file(label_path, boxes)
-                saved += 1
-
-                if saved % 50 == 0:
-                    self.logger.info(f"Saved {saved} labeled frames so far...")
-
-        cap.release()
-        self.logger.info(f"Dataset generation complete. Total labeled frames: {saved}")
-
-        yaml_path = self._write_yaml()
-        self.logger.info(f"Dataset YAML created at {yaml_path}")
+    def create_from_video(self, video_source, segments=None):
+        if segments is not None:
+            if not segments or any(
+                not (math.isfinite(start) and math.isfinite(end) and 0 <= start < end)
+                for start, end in segments
+            ):
+                raise ValueError("Segments must have finite times with 0 <= start < end.")
+        source = str(video_source)
+        is_url = source.startswith(("https://", "http://"))
+        identity = source if is_url else str(Path(source).resolve())
+        prefix = (
+            ("video" if is_url else Path(source).stem)
+            + "_"
+            + hashlib.sha256(identity.encode()).hexdigest()[:12]
+        )
+        with tempfile.TemporaryDirectory(prefix="image-tagging-") as directory:
+            video = self._download_youtube(source, directory) if is_url else Path(source)
+            self._process_video(video, prefix, segments)
         return self.output_dir
 
-    def _run_inference(self, frame):
-        if self.model_type == "onnx":
-            img = frame.transpose(2, 0, 1)
-            img = img[None].astype("float32") / 255.0
-            ort_inputs = {self.model.get_inputs()[0].name: img}
-            return self.model.run(None, ort_inputs)
-        elif isinstance(self.model, YOLO):
-            return self.model.predict(frame, imgsz=self.imgsz, device=str(self.device), verbose=False)
-        else:
-            with torch.no_grad():
-                tensor = (
-                    torch.from_numpy(frame)
-                    .permute(2, 0, 1)
-                    .unsqueeze(0)
-                    .float()
-                    .to(self.device)
-                    / 255.0
+    def _process_video(self, video, prefix, segments):
+        cap = cv2.VideoCapture(str(video))
+        saved = 0
+        try:
+            if not cap.isOpened():
+                raise FileNotFoundError(f"Cannot open video: {video}")
+            fps = cap.get(cv2.CAP_PROP_FPS)
+            count = cap.get(cv2.CAP_PROP_FRAME_COUNT)
+            if not math.isfinite(fps) or fps <= 0 or not math.isfinite(count) or count < 1:
+                raise ValueError(f"Video has invalid FPS or frame count: {video}")
+            count = int(count)
+            # Merge overlapping segments so a frame is considered only once.
+            ranges = (
+                [(0, count)]
+                if segments is None
+                else sorted(
+                    (min(count, int(start * 60 * fps)), min(count, math.ceil(end * 60 * fps)))
+                    for start, end in segments
                 )
-                return self.model(tensor)
+            )
+            merged = []
+            for start, end in ranges:
+                if start >= end:
+                    continue
+                if merged and start <= merged[-1][1]:
+                    merged[-1] = (merged[-1][0], max(end, merged[-1][1]))
+                else:
+                    merged.append((start, end))
+            if not merged:
+                raise ValueError("No requested segments overlap the video.")
+            for start, end in merged:
+                if start and not cap.set(cv2.CAP_PROP_POS_FRAMES, start):
+                    raise RuntimeError(f"Cannot seek to frame {start}.")
+                for index in range(start, end):
+                    ok, frame = cap.read()
+                    if not ok:
+                        raise RuntimeError(f"Cannot read video frame {index}.")
+                    if self.random.random() >= self.sample_prob:
+                        continue
+                    split = self.random.choices(SPLITS, weights=self.splits)[0]
+                    stem = f"{prefix}_{index:06d}"
+                    # Existing frames may have been manually reviewed; never overwrite them.
+                    if any(
+                        (self.output_dir / kind / candidate / f"{stem}{suffix}").exists()
+                        for candidate in SPLITS
+                        for kind, suffix in (("images", ".jpg"), ("labels", ".txt"))
+                    ):
+                        continue
+                    result = self.model.predict(
+                        frame, imgsz=self.imgsz, conf=self.conf, device=self.device, verbose=False
+                    )[0]
+                    if result.boxes is None:
+                        raise ValueError("Model did not return detection boxes.")
+                    if not len(result.boxes) and not self.include_empty:
+                        continue
+                    image_path = self.output_dir / "images" / split / f"{stem}.jpg"
+                    label_path = self.output_dir / "labels" / split / f"{stem}.txt"
+                    if not cv2.imwrite(str(image_path), frame):
+                        raise OSError(f"Cannot save image: {image_path}")
+                    try:
+                        rows = [
+                            f"{int(cls)} " + " ".join(f"{v:.6f}" for v in coordinates)
+                            for cls, coordinates in zip(
+                                result.boxes.cls.tolist(), result.boxes.xywhn.tolist()
+                            )
+                        ]
+                        atomic_write(label_path, "\n".join(rows) + ("\n" if rows else ""))
+                    except Exception:
+                        image_path.unlink(missing_ok=True)
+                        raise
+                    saved += 1
+        finally:
+            cap.release()
+        self.logger.info(
+            "Dataset generation complete: %s images saved to %s", saved, self.output_dir
+        )
 
-    def _write_yaml(self) -> Path:
-        yaml_path = self.output_dir / "data.yaml"
-        names = getattr(self.model, "names", None)
-        if not names:
-            names = {0: "object"}
-
-        lines = [
-            f"path: {self.output_dir}",
-            "train: images/train",
-            "val: images/val",
-            "test: images/test",
-            "names:",
-        ]
-        lines += [f"  {i}: {name}" for i, name in names.items()]
-        yaml_path.write_text("\n".join(lines))
-        return yaml_path
+    def _write_yaml(self):
+        path = self.output_dir / "data.yaml"
+        data = {
+            "path": str(self.output_dir.resolve()),
+            **{split: f"images/{split}" for split in SPLITS},
+            "names": self.names,
+        }
+        # Preserve additional metadata when extending an existing dataset.
+        if path.exists():
+            existing = yaml.safe_load(path.read_text())
+            for split in SPLITS:
+                if existing.get(split) != data[split]:
+                    raise ValueError("Generation requires images/<split> dataset paths.")
+            data = {**existing, **data}
+        atomic_write(path, yaml.safe_dump(data, sort_keys=False))
+        return path

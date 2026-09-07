@@ -1,3 +1,7 @@
 pydantic==2.12.0
 tensorboard==2.20.0
 ultralytics==8.3.211
+opencv-python>=4.6.0
+yt-dlp[default]>=2026.8.19
+deno>=2.3.0
+PyYAML>=6.0
