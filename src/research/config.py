@@ -109,6 +109,14 @@ class Fallback(Settings):
     max_wait_hours: float = Field(24, gt=0, le=168)
 
 
+class DataGrowth(Settings):
+    enabled: bool = True
+    min_train_images: int = Field(48, ge=1)
+    max_rounds: int = Field(3, ge=0, le=10)
+    sources_per_round: int = Field(3, ge=1, le=10)
+    trials_per_round: int = Field(2, ge=1)
+
+
 class Campaign(Settings):
     campaign_id: str = Field("football-pilot", pattern=r"^[a-zA-Z0-9_-]+$")
     output_dir: Path = Path("experiments/football-pilot")
@@ -122,12 +130,14 @@ class Campaign(Settings):
         "only when identifiable. Reject ambiguous frames rather than guessing."
     )
     codex_executable: str = "codex"
-    codex_model: str | None = None
+    codex_model: str | None = "gpt-6-astra"
+    codex_reasoning_effort: Literal["low", "medium", "high", "xhigh", "max"] | None = "high"
     fallback: Fallback = Field(default_factory=Fallback)
     proposals: Literal["codex", "queue"] = "codex"
     acquisition: Acquisition = Field(default_factory=Acquisition)
     evaluation: Evaluation = Field(default_factory=Evaluation)
     budget: Budget = Field(default_factory=Budget)
+    data_growth: DataGrowth = Field(default_factory=DataGrowth)
     recipes: list[Recipe] = Field(
         default_factory=lambda: [
             Recipe(id="nano640", hypothesis="Establish a small-model baseline."),

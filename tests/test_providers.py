@@ -1,12 +1,13 @@
 """Provider routing, quota classification and free-model safeguards without network calls."""
 
 import json
+import subprocess
 from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
 
-from src.research.agent import OpenCodeAgent, ResearchAgent, Review
+from src.research.agent import CodexAgent, OpenCodeAgent, ResearchAgent, Review
 from src.research.config import Campaign
 from src.research.providers import (
     ProvidersUnavailable,
@@ -68,6 +69,30 @@ def test_fallback_persists_and_returns_to_codex(cfg, tmp_path, monkeypatch):
     assert len(codex.calls) == 1
     assert read_json(tmp_path / "third/provider.json")["provider"] == "codex"
     assert read_json(cfg.output_dir / "providers.json")["active"] == "codex"
+    assert read_json(tmp_path / "third/provider.json")["reasoning_effort"] == "high"
+    assert read_json(tmp_path / "first/provider.json")["reasoning_effort"] is None
+
+
+@pytest.mark.parametrize("effort", ["high", "medium", None])
+def test_codex_passes_explicit_model_and_reasoning(cfg, tmp_path, monkeypatch, effort):
+    cfg.codex_reasoning_effort = effort
+    monkeypatch.setattr("src.research.agent.executable_path", lambda name: "/bin/codex")
+
+    def execute(command, **kwargs):
+        assert command[command.index("--model") + 1] == "gpt-6-astra"
+        assert "--ignore-user-config" in command
+        assert command[command.index("--sandbox") + 1] == "read-only"
+        if effort is None:
+            assert "--config" not in command
+        else:
+            assert command[command.index("--config") + 1] == f'model_reasoning_effort="{effort}"'
+        Path(command[command.index("--output-last-message") + 1]).write_text(
+            accepted().model_dump_json()
+        )
+        return []
+
+    monkeypatch.setattr("src.research.agent.execute_events", execute)
+    assert CodexAgent(cfg).request("inspect", Review, tmp_path / "reply").status == "accepted"
 
 
 @pytest.mark.parametrize(
@@ -161,6 +186,50 @@ def test_shell_path_resolution_handles_nvm_without_interpolating_input(tmp_path,
     assert executable_path("opencode") == str(executable)
     with pytest.raises(RuntimeError, match="Executable not found"):
         executable_path("$(unexpected-command)")
+
+
+@pytest.mark.parametrize("shell_failure", [False, True])
+def test_codex_discovery_without_editor_path(tmp_path, monkeypatch, shell_failure):
+    monkeypatch.setattr("src.research.providers.shutil.which", lambda name: None)
+    monkeypatch.setattr(Path, "home", lambda: tmp_path)
+    monkeypatch.setattr("src.research.providers.platform.system", lambda: "Darwin")
+    monkeypatch.setattr("src.research.providers.platform.machine", lambda: "arm64")
+
+    def shell(command, **kwargs):
+        if shell_failure:
+            raise subprocess.TimeoutExpired(command, 10)
+        return SimpleNamespace(stdout="")
+
+    monkeypatch.setattr("src.research.providers.subprocess.run", shell)
+    paths = []
+    for version, architecture, executable in [
+        ("26.9.1", "aarch64", True),
+        ("26.10.1", "aarch64", True),
+        ("26.11.1", "aarch64", False),
+        ("26.12.1", "x86_64", True),
+    ]:
+        path = (
+            tmp_path
+            / ".vscode/extensions"
+            / f"openai.chatgpt-{version}-darwin-arm64"
+            / f"bin/macos-{architecture}/codex"
+        )
+        path.parent.mkdir(parents=True)
+        path.touch(mode=0o755 if executable else 0o644)
+        paths.append(path)
+    assert executable_path("codex") == str(paths[1])
+    # Do not silently replace an explicitly configured missing executable or another provider.
+    for name in (str(tmp_path / "missing/codex"), "opencode"):
+        with pytest.raises(RuntimeError, match="Executable not found"):
+            executable_path(name)
+
+
+def test_explicit_cli_on_path_takes_precedence(monkeypatch):
+    monkeypatch.setattr("src.research.providers.shutil.which", lambda name: "/opt/bin/codex")
+    monkeypatch.setattr(
+        "src.research.providers.bundled_codex", lambda: pytest.fail("should use PATH")
+    )
+    assert executable_path("codex") == "/opt/bin/codex"
 
 
 @pytest.mark.parametrize("cost,vision", [(1, True), (0, False)])

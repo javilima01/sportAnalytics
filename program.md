@@ -16,6 +16,15 @@ promotes the best recipe, trains seeds 0/1/2, and opens the final test only when
 three pass. It records decisions in `autonomous.json` and metrics in `results.csv`.
 No user input is needed between stages.
 
+With `data_growth.enabled`, reach the training-image minimum, then alternate short
+trial batches with validation-guided searches and agent labeling of new training
+matches. Keep validation/test fixed and never reuse their matches for training.
+Existing labels are immutable; append-only training versions are recorded by the
+controller. All versions share download, trial-count and runtime budgets. Inspect
+`data_growth/` for search hypotheses and outcomes, and `dataset_versions/` for
+manifests. Promotion/confirmation use the current version, and growth stops before
+those stages. Do not reset budgets to force another collection round.
+
 Keep the objective fixed: minimize student parameters subject to every macro and
 ball threshold in `EXPERIMENT.md`. Extra accuracy does not outweigh smaller size
 once both candidates pass. The YOLOv8-L annotation teacher is independent of the

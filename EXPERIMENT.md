@@ -45,8 +45,10 @@ documents the protocol; it is not a script that runs itself.
 | Condition | Automatic action |
 | --- | --- |
 | No adequate dataset | Search/select videos, download, sample and let Codex label images; retry within acquisition limits |
-| Dataset passes integrity and coverage checks | Freeze it and run the baseline recipes |
-| Exploration has trials available | Give Codex prior trial metrics and quality targets; validate and execute its next recipe |
+| Dataset passes integrity and coverage checks | Freeze validation/test and version the initial training set |
+| Training set has fewer than `data_growth.min_train_images` | Search and label additional training matches within growth budgets before trials |
+| Exploration has trials available | Run at most `data_growth.trials_per_round` short trials, then assess validation results |
+| Quality gates fail, or a smaller tested student still fails | Ask the agent for targeted training-video searches, append accepted training labels, audit a new dataset version, and resume trials |
 | Exploration finishes with a candidate | Promote the best candidate with a 30-minute budget |
 | Promotion finishes with a candidate | Train the selected recipe with seeds 0/1/2 and longer budgets |
 | All three confirmation seeds pass | Evaluate seed 0 once on test and report the artifact |
@@ -57,6 +59,36 @@ results. Python computes rankings and enforces the fixed gates. A feasible model
 always ranks ahead of an infeasible one; among feasible models, fewer parameters
 are preferred. Autonomy does not guarantee that the pilot data and budget can
 produce a model meeting every quality target.
+
+With `data_growth.enabled: true` (the default), collection and exploration alternate.
+The minimum training set is 48 accepted images. Up to three additional data rounds
+may select at most three new matches each, sharing the original 10 GB download and
+20 GB storage limits with initial acquisition. Each round has a 30-minute active
+window including planning, search, download and labeling. Provider waiting follows
+the same persisted cooldown rules. Initial acquisition retains its separate
+three-round coverage allowance. If the training minimum remains unmet when budgets
+run out, stop; never silently train the tiny recovery set as a finished dataset.
+
+After each two-trial batch, fixed validation metrics guide search hypotheses. The
+agent receives macro/ball/per-class validation scores and failed gates, never test
+results. Aggregate scores suggest hypotheses; they do not prove which camera or
+weather conditions caused errors. Discovery excludes known videos/matches and only
+accepts `split: train`; identifying alternate edits still relies on agent metadata
+assessment. Budget checks and the frozen dataset audit reject overlap.
+
+Training growth is append-only: existing images, labels, match assignments and
+dataset YAML cannot change. Every version stores its complete manifest and hashes
+in `dataset_versions/`; trials and `results.csv` identify the version they used.
+`data_growth/round-*/` stores feedback, search plans, selected sources and outcomes.
+An interrupted round resumes its recorded plan without spending another round or
+relabeling accepted frames. Ordinary failed data rounds are recorded and bounded;
+corrupted data stop the workflow.
+
+After growth, retry the strongest prior baseline recipe, then prioritize untested
+model sizes. Trial attempts and runtime remain cumulative across all data versions.
+Promotion and confirmation use only the current version. Training data stop growing
+when exploration finishes; all confirmation seeds must pass on that version before
+the single final test. Set `data_growth.enabled: false` for a fixed-dataset campaign.
 
 Accepted images and completed trials are not repeated. Autonomous resume can
 launch a fresh attempt for an interrupted trial, retaining and charging the old
@@ -69,12 +101,24 @@ the current stage, completed phases, acquisition rounds, decisions and final out
 
 ### Automatic provider fallback
 
+The configured primary agent is `codex_model: gpt-6-astra` with
+`codex_reasoning_effort: high`. Use `medium` before the first campaign launch if
+preferred. The runner passes both explicitly to `codex exec`; it ignores the CLI's
+user configuration and does not inherit this chat's model/reasoning selection.
+Successful request provenance records both settings. These configure the research
+and annotation agent; the YOLO teacher and trained student are separate models.
+
 Codex is preferred. If its CLI reports a usage/quota limit, the pending request is
 sent to **`opencode/muse-spark-1.3-contributor-free`** through OpenCode. The model ID
 matches the [OpenCode Zen catalog](https://opencode.ai/docs/zen/); the local catalog
 and a live image-annotation smoke test confirmed image input support. Executables
 added by interactive terminal startup (such as nvm installations) are discovered
 automatically, so the IDE's older PATH does not need to be edited.
+On macOS, if `codex` is absent from both PATHs, the controller also discovers the
+newest executable Codex bundle for the native architecture in VS Code, VS Code
+Insiders or Cursor's standard extension directory. This lets `research init` work
+when the extension is installed but the bare `codex` terminal command is unavailable.
+Explicit executable paths and installed CLI commands take precedence.
 
 `fallback.codex_retry_seconds` defaults to 300: at a subsequent request boundary
 after that cooldown, try Codex first and switch back on success. An earlier reset
@@ -113,7 +157,8 @@ software smoke tests do not establish football accuracy or sustained throughput.
 
 | Stage | Default limit |
 | --- | --- |
-| Acquisition round | 30 minutes; at most three automatic rounds per campaign |
+| Initial acquisition | 30 minutes per round; at most three coverage rounds |
+| Training-data growth | 30 minutes per round; at most three rounds, three new matches each |
 | Source downloads / dataset storage | 10 GB cumulative / 20 GB |
 | Annotation | 120 seconds per image; two attempts |
 | Missing starting checkpoint preparation | Five minutes per checkpoint |
@@ -132,8 +177,15 @@ the unfinished attempt is charged its full reserved time.
 
 Acquisition, Codex proposals, checkpoint preparation and final testing are separate
 from the aggregate model-trial budget. Acquisition time resets per invocation;
-download bytes and retry counts persist. Downloads fetch the whole video before
-sampling the chosen segment. Disk limits are polled and can slightly overshoot;
+download bytes and retry counts persist. YouTube acquisition downloads only the
+selected time interval using yt-dlp and the FFmpeg binary supplied by
+`imageio-ffmpeg`. It requests precise cuts and limits video height to the larger
+of 1080 and `teacher_imgsz`; no full-match fallback is used if clipping fails.
+Sources are interleaved across splits, with splits having fewer accepted images
+processed first. Exhausted download/storage budgets produce an explicit stop
+reason instead of consuming further acquisition rounds with no available work.
+Cached frames can still be labeled within the current round without downloading.
+Disk limits are polled and can slightly overshoot;
 they measure local files, not exact network traffic. Staging frames stay for resume.
 
 Longer confirmation is configurable before starting. If learning is still improving
@@ -157,10 +209,18 @@ run does not prove convergence.
 5. Save accepted YOLO labels with prompts, structured responses, validated decisions,
    image/label hashes, source URLs, match IDs and timestamps. Empty labels require
    the agent to report no target objects. Reject ambiguous/unresolved frames.
-6. Audit and freeze the dataset before training. Reject match overlap, exact
+6. Audit and version the dataset before training, freezing validation/test. Reject match overlap, exact
    duplicates across splits, changed labels, mismatched paths, missing/unmanifested
    files and unsupported classes. Near-duplicate detection and independent match
-   identity verification are not implemented.
+identity verification are not implemented.
+
+An acquisition-only failure may be recovered into a **new** campaign by copying
+accepted labels and assigning whole matches to new splits before any training or
+evaluation. Preserve the original campaign, annotation hashes and source provenance;
+record the reassignment in `recovery.json` and rerun the full integrity/coverage
+audit. This is a new pilot benchmark, not a continuation of a measured benchmark.
+Never repartition data after model selection or test exposure, reset consumed
+download allowances, or silently relax coverage/accuracy gates.
 
 Default taxonomy: class 0 includes active players and goalkeepers; class 1 is the
 match football. Referees, staff and spectators are excluded. Change names, taxonomy
@@ -195,7 +255,8 @@ meaningful later benchmark, raise `evaluation.min_matches` and
 versioned campaign. If coverage is incomplete, the autonomous workflow reruns
 acquisition within its round/retry/download allowances. A source plan
 that cannot supply adequate data needs a revised campaign. Never lower support
-gates or call teacher output reviewed just to get training started.
+gates or call teacher output reviewed just to get training started. Passing these
+pilot support gates does not prove that the dataset is large or diverse enough.
 
 Evaluation references are **agent-generated labels**, not independently verified
 ground truth. Scores measure agreement with those labels. Shared teacher/agent
@@ -244,8 +305,10 @@ a pilot with few unique frames is not a deployment benchmark.
 Codex proposes validated recipe fields: starting checkpoint, image size, batch,
 epochs, learning rate, optimizer, mosaic, scale and rotation. Proposals may use
 only checkpoint paths in the original recipe list. Defaults compare YOLOv8n at
-640 and 960, followed by YOLOv8s/m/l/x at 640. These six baseline trials leave two
-agent-proposed trials within the default eight-trial exploration budget. The agent
+640 and 960, followed by YOLOv8s/m/l/x at 640. With a fixed dataset these six baseline
+trials leave two agent-proposed trials within the default eight-trial exploration
+budget. With data growth, retraining uses the same eight-attempt allowance, so not
+all sizes or proposals are guaranteed to run. The agent
 can tune any of those student sizes; teacher selection does not restrict them.
 The objective is minimum measured student parameters subject to **every** fixed
 macro/ball gate, not maximum accuracy regardless of size. Extra accuracy never
@@ -256,9 +319,12 @@ proof that no smaller architecture or longer-trained candidate could work.
 Arbitrary architecture/code mutation is outside this controller's current scope.
 
 Code, relevant dependency versions, initial checkpoint hashes, campaign settings
-and dataset snapshot must remain fixed. Each trial saves its job, logs, platform/
+and the validation/test benchmark must remain fixed. Training additions require
+the recorded growth protocol above; arbitrary dataset edits remain forbidden.
+Each trial saves its dataset version, job, logs, platform/
 dependency details, completed epochs, predictions, metrics and checkpoint hash.
-Start a new campaign for implementation, dataset or budget changes.
+Start a new campaign for implementation, benchmark or budget changes, or dataset
+edits outside the controlled training-growth protocol.
 
 ## Confirmation and final artifact
 

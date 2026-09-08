@@ -12,7 +12,7 @@ import yaml
 from pydantic import ValidationError
 
 from src.dataset import atomic_write, write_labels
-from src.research.acquisition import acquire, validate_sources
+from src.research.acquisition import acquire, extract_source, source_order, validate_sources
 from src.research.agent import Annotation, Review, strict_schema
 from src.research.config import Campaign, Evaluation, Recipe, Source, load_campaign
 from src.research.controller import finalize, initialize, run_campaign, run_trial
@@ -32,6 +32,7 @@ def campaign(tmp_path):
         workers=0,
         proposals="queue",
         recipes=[Recipe(id="baseline", hypothesis="baseline", model=str(checkpoint))],
+        data_growth={"enabled": False},
     )
     cfg.acquisition.teacher = str(checkpoint)
     initialize(cfg)
@@ -448,7 +449,8 @@ def test_changed_initial_checkpoint_is_rejected(campaign):
 
 
 @pytest.mark.integration
-def test_real_video_extraction_worker(tmp_path):
+@pytest.mark.parametrize("remote", [False, True])
+def test_real_video_extraction_worker(tmp_path, monkeypatch, remote):
     from ultralytics import YOLO
 
     from src.research.acquisition import ROOT
@@ -465,6 +467,16 @@ def test_real_video_extraction_worker(tmp_path):
         writer.write(np.full((64, 64, 3), i * 60, np.uint8))
     writer.release()
     source = Source(id="local", url=str(video), match_id="match", split="train")
+    if remote:
+        source.url = "https://example.com/match"
+        source.start_minutes, source.end_minutes = 20, 22
+
+        def download(self, url, folder, *, section, max_height):
+            assert section == (1200, 1320)
+            assert max_height == 1080
+            return video
+
+        monkeypatch.setattr("src.creation.DatasetCreator._download_youtube", download)
     job = tmp_path / "job.json"
     save_json(
         job,
@@ -475,14 +487,19 @@ def test_real_video_extraction_worker(tmp_path):
             "folder": str(tmp_path),
         },
     )
-    run_process(
-        [sys.executable, "-m", "src.research.worker", str(job)],
-        timeout=60,
-        log=tmp_path / "extract.log",
-        cwd=ROOT,
-    )
+    if remote:
+        extract_source(read_json(job))
+    else:
+        run_process(
+            [sys.executable, "-m", "src.research.worker", str(job)],
+            timeout=60,
+            log=tmp_path / "extract.log",
+            cwd=ROOT,
+        )
     frames = read_json(tmp_path / "frames.json")
-    assert [f["frame_index"] for f in frames] == [0, 3]
+    offset = 6000 if remote else 0
+    assert [f["frame_index"] for f in frames] == [offset, offset + 3]
+    assert [f["time_seconds"] for f in frames] == [offset / 5, (offset + 3) / 5]
     assert all(Path(f["image"]).is_file() and isinstance(f["proposals"], list) for f in frames)
 
 
@@ -628,10 +645,318 @@ def test_config_and_annotation_reject_invalid_values(tmp_path):
     assert schema["additionalProperties"] is False
 
 
+def enable_growth(cfg, **settings):
+    cfg.data_growth.enabled = True
+    cfg.data_growth.min_train_images = 1
+    cfg.data_growth.max_rounds = 1
+    cfg.data_growth.trials_per_round = 1
+    for name, value in settings.items():
+        setattr(cfg.data_growth, name, value)
+    cfg.budget.max_exploration_trials = 2
+    (cfg.output_dir / "contract.json").unlink()
+    initialize(cfg)
+
+
+def append_growth_image(cfg, split="train", commit=True):
+    from src.research.controller import freeze_dataset
+
+    image = cfg.dataset_dir / "images" / split / "new.jpg"
+    cv2.imwrite(str(image), np.full((64, 64, 3), 240, np.uint8))
+    label = cfg.dataset_dir / "labels" / split / "new.txt"
+    write_labels(label, [(0, (5, 5, 30, 55)), (1, (40, 40, 48, 48))], (64, 64))
+    manifest = cfg.dataset_dir / "manifest.jsonl"
+    records = [json.loads(line) for line in manifest.read_text().splitlines()]
+    records.append(
+        {
+            "image": str(image.relative_to(cfg.dataset_dir)),
+            "label": str(label.relative_to(cfg.dataset_dir)),
+            "split": split,
+            "match_id": "new-match",
+            "image_sha256": file_hash(image),
+            "label_sha256": file_hash(label),
+            "review_status": "agent_labeled",
+        }
+    )
+    atomic_write(manifest, "".join(json.dumps(r) + "\n" for r in records))
+    return freeze_dataset(cfg, allow_training_growth=True) if commit else None
+
+
+def test_autonomous_alternates_validation_feedback_and_training_growth(campaign):
+    from src.research.autonomous import run_autonomous
+
+    enable_growth(campaign)
+    feedbacks = []
+    held_out = {s: file_hash(campaign.dataset_dir / f"labels/{s}/{s}.txt") for s in ("val", "test")}
+
+    def worker(command, **kwargs):
+        fake_worker(command, **kwargs)
+        job = read_json(command[-1])
+        if job["kind"] != "test" and not (campaign.dataset_dir / "images/train/new.jpg").exists():
+            metrics = read_json(Path(job["folder"]) / "metrics.json")
+            metrics["ball"]["recall"] = 0.2
+            save_json(Path(job["folder"]) / "metrics.json", metrics)
+
+    def grow(cfg, agent, directory, feedback):
+        feedbacks.append(feedback)
+        assert feedback["trials"][0]["validation"]["failures"] == ["ball.recall"]
+        assert "checkpoint" not in feedback["trials"][0]["validation"]
+        assert not (cfg.output_dir / "final_test.json").exists()
+        append_growth_image(cfg)
+        return {"added_images": 1}
+
+    result = run_autonomous(campaign, agent=ReadyAgent(), executor=worker, grower=grow)
+    assert result["status"] == "completed" and result["data_rounds"] == len(feedbacks) == 1
+    trials = read_json(campaign.output_dir / "state.json")["trials"]
+    assert len(trials) == 6
+    assert trials[0]["dataset_version"] != trials[1]["dataset_version"]
+    assert all(r["dataset_version"] == trials[1]["dataset_version"] for r in trials[1:])
+    assert all(
+        file_hash(campaign.dataset_dir / f"labels/{s}/{s}.txt") == digest
+        for s, digest in held_out.items()
+    )
+
+
+def test_growth_collects_minimum_before_training_and_resumes_partial_append(campaign):
+    from src.research.autonomous import run_autonomous
+    from src.research.controller import freeze_dataset
+
+    enable_growth(campaign, min_train_images=2)
+    calls = []
+
+    def interrupted(cfg, agent, directory, feedback):
+        calls.append(directory)
+        assert not read_json(cfg.output_dir / "state.json", {}).get("trials")
+        append_growth_image(cfg, commit=False)
+        raise KeyboardInterrupt
+
+    with pytest.raises(KeyboardInterrupt):
+        run_autonomous(campaign, agent=ReadyAgent(), executor=fake_worker, grower=interrupted)
+    assert read_json(campaign.output_dir / "autonomous.json")["growth_pending"] == "round-001"
+
+    def resume(cfg, agent, directory, feedback):
+        assert directory == calls[0]
+        freeze_dataset(cfg, allow_training_growth=True)
+        return {"added_images": 1}
+
+    result = run_autonomous(campaign, agent=ReadyAgent(), executor=fake_worker, grower=resume)
+    assert result["status"] == "completed" and result["data_rounds"] == 1
+    assert len(list(campaign.dataset_dir.glob("images/train/*.jpg"))) == 2
+
+
+@pytest.mark.parametrize("split", ["val", "test"])
+def test_growth_never_appends_to_frozen_benchmark(campaign, split):
+    from src.research.controller import freeze_dataset
+
+    enable_growth(campaign)
+    freeze_dataset(campaign)
+    with pytest.raises(ValueError, match="Validation and test"):
+        append_growth_image(campaign, split)
+
+
+def test_growth_rejects_modified_existing_labels_even_with_updated_manifest_hash(campaign):
+    from src.research.controller import freeze_dataset
+
+    enable_growth(campaign)
+    freeze_dataset(campaign)
+    manifest = campaign.dataset_dir / "manifest.jsonl"
+    records = [json.loads(line) for line in manifest.read_text().splitlines()]
+    label = campaign.dataset_dir / records[0]["label"]
+    label.write_text("0 .3 .3 .2 .2\n1 .6 .6 .1 .1\n")
+    records[0]["label_sha256"] = file_hash(label)
+    atomic_write(manifest, "".join(json.dumps(r) + "\n" for r in records))
+    with pytest.raises(ValueError, match="Existing frozen"):
+        freeze_dataset(campaign, allow_training_growth=True)
+
+
+def test_confirmation_from_old_training_version_cannot_open_test(campaign):
+    from src.research.controller import ConfirmationIncomplete
+
+    enable_growth(campaign)
+    for phase in ("explore", "promote", "confirm"):
+        run_campaign(campaign, phase=phase, executor=fake_worker)
+    append_growth_image(campaign)
+    with pytest.raises(ConfirmationIncomplete):
+        finalize(campaign, executor=fake_worker)
+    with pytest.raises(ValueError, match="No completed"):
+        run_campaign(campaign, phase="promote", executor=fake_worker)
+    assert not (campaign.output_dir / "final_test.json").exists()
+
+
+def test_growth_respects_exhausted_download_budget(campaign):
+    from src.research.autonomous import run_autonomous
+
+    enable_growth(campaign, min_train_images=2)
+    save_json(campaign.output_dir / "acquisition.json", {"bytes_downloaded": 10_000_000_000})
+    result = run_autonomous(
+        campaign,
+        agent=ReadyAgent(),
+        executor=fake_worker,
+        grower=lambda *a, **k: pytest.fail("download budget was reset"),
+    )
+    assert result["status"] == "stopped" and result["data_rounds"] == 0
+    assert not (campaign.output_dir / "state.json").exists()
+
+
+def test_training_discovery_rejects_held_out_matches(campaign, monkeypatch):
+    import src.research.acquisition as acquisition
+    from src.research.agent import Discovery
+
+    def search(command, **kwargs):
+        save_json(kwargs["log"], {"entries": [{"id": "new-edit", "title": "same match"}]})
+
+    class Agent:
+        def request(self, *args, **kwargs):
+            return Discovery(
+                explanation="new edit",
+                sources=[
+                    Source(
+                        id="new-edit",
+                        url="unused",
+                        match_id="held-out",
+                        split="train",
+                    )
+                ],
+            )
+
+    monkeypatch.setattr(acquisition, "run_process", search)
+    with pytest.raises(ValueError, match="reused an existing match"):
+        acquisition.discover(
+            campaign,
+            Agent(),
+            time.monotonic() + 60,
+            training_only=True,
+            existing=[{"id": "old-edit", "match_id": "held-out"}],
+            limit=1,
+        )
+
+
+def test_growth_plans_searches_and_labels_real_appended_records(campaign, monkeypatch):
+    import src.research.acquisition as acquisition
+    from src.research.agent import Discovery
+    from src.research.controller import freeze_dataset
+    from src.research.growth import DataSearch, grow_training, validation_feedback
+
+    enable_growth(campaign)
+    snapshot = freeze_dataset(campaign)
+    save_json(
+        campaign.output_dir / "acquisition.json",
+        {
+            "sources": [
+                Source(
+                    id=s, url=f"https://example.com/{s}", match_id=f"match-{i}", split=s
+                ).model_dump()
+                for i, s in enumerate(("train", "val", "test"))
+            ],
+            "attempts": {"train": {"count": 2, "status": "extracted"}},
+            "bytes_downloaded": 123,
+            "frames": {},
+        },
+    )
+    calls = []
+
+    def process(command, **kwargs):
+        calls.append(command)
+        if "yt_dlp" in command:
+            assert "football distant ball" in command[-1]
+            save_json(kwargs["log"], {"entries": [{"id": "new-source", "title": "New match"}]})
+        else:
+            job = read_json(command[-1])
+            assert job["source"]["split"] == "train"
+            folder = Path(job["folder"])
+            image = folder / "new-source_00000000.jpg"
+            cv2.imwrite(str(image), np.full((64, 64, 3), 240, np.uint8))
+            (folder / "download").mkdir()
+            (folder / "download/video.mp4").write_bytes(b"clip")
+            save_json(
+                folder / "frames.json",
+                [{"image": str(image), "frame_index": 0, "time_seconds": 0, "proposals": []}],
+            )
+
+    class Agent:
+        def request(self, prompt, schema, directory, **kwargs):
+            if schema == DataSearch:
+                return DataSearch(reason="Improve ball coverage", queries=["football distant ball"])
+            assert "ONLY new training" in prompt and "match-2" in prompt
+            return Discovery(
+                explanation="Distinct match",
+                sources=[
+                    Source(
+                        id="new-source",
+                        url="unused",
+                        match_id="new-match",
+                        split="train",
+                    )
+                ],
+            )
+
+        def label(self, *args):
+            return Review(
+                status="accepted",
+                reason="Verified both objects",
+                boxes=[
+                    Annotation(class_id=0, x1=0.1, y1=0.1, x2=0.4, y2=0.9),
+                    Annotation(class_id=1, x1=0.7, y1=0.7, x2=0.8, y2=0.8),
+                ],
+            )
+
+    monkeypatch.setattr(acquisition, "run_process", process)
+    directory = campaign.output_dir / "data_growth/round-001"
+    result = grow_training(campaign, Agent(), directory, validation_feedback(campaign, []))
+    assert result["added_images"] == 1 and len(calls) == 2
+    assert read_json(campaign.output_dir / "acquisition.json")["bytes_downloaded"] == 127
+    assert read_json(campaign.output_dir / "snapshot.json")["version"] != snapshot["version"]
+    assert grow_training(campaign, Agent(), directory, {}) == result
+    assert len(calls) == 2
+
+
+def test_growth_quota_retry_keeps_same_round(campaign):
+    from src.research.autonomous import run_autonomous
+    from src.research.providers import ProvidersUnavailable
+
+    enable_growth(campaign, min_train_images=2)
+    calls = []
+
+    def grow(cfg, agent, directory, feedback):
+        calls.append(directory)
+        if len(calls) == 1:
+            raise ProvidersUnavailable(time.time() - 1)
+        append_growth_image(cfg)
+        return {"added_images": 1}
+
+    result = run_autonomous(campaign, agent=ReadyAgent(), executor=fake_worker, grower=grow)
+    assert result["status"] == "completed" and result["data_rounds"] == 1
+    assert len(calls) == 2 and calls[0] == calls[1]
+
+
 def test_source_plan_requires_distinct_matches():
     sources = [Source(id=s, url=s, match_id="same", split=s) for s in ("train", "val", "test")]
     with pytest.raises(ValueError, match="share a split"):
         validate_sources(sources, 6)
+
+
+def test_sources_cover_splits_before_extra_training_matches():
+    sources = [
+        Source(id=str(i), url=str(i), match_id=str(i), split=split)
+        for i, split in enumerate(("train", "train", "train", "val", "test"))
+    ]
+    assert [s.split for s in source_order(sources, [])][:3] == ["train", "val", "test"]
+    assert [s.split for s in source_order(sources, [{"split": "train"}])][:2] == ["val", "test"]
+
+
+def test_download_exhaustion_stops_without_useless_rounds(campaign):
+    from src.research.autonomous import run_autonomous
+
+    campaign.dataset_dir.rename(campaign.dataset_dir.with_name("old"))
+    calls = []
+
+    def collect(cfg, agent):
+        calls.append(cfg)
+        save_json(cfg.output_dir / "acquisition.json", {"stop_reason": "Download budget exhausted"})
+
+    result = run_autonomous(campaign, agent=ReadyAgent(), collector=collect)
+    assert len(calls) == result["acquisition_rounds"] == 1
+    assert result["status"] == "stopped"
+    assert "Download budget exhausted" in result["reason"]
 
 
 def test_acquisition_uses_agent_boxes_and_resumes(tmp_path):

@@ -120,6 +120,13 @@ Defaults use this Mac's MPS device, 15-minute exploration trials and a pilot dat
 Later stages automatically use 30-minute promotion and longer confirmation runs.
 It stops if its budgets are exhausted or quality remains insufficient.
 
+By default, `data_growth` collects at least 48 accepted training images and
+reassesses data needs after every two exploration trials. Validation failures can
+trigger new training-video searches and automatic labeling, within three extra
+collection rounds and the same download budget. Validation/test data stay fixed;
+each training-data version and its trial results are recorded. Promotion and
+confirmation use the current version, then the agent tests the final model once.
+
 Keep the terminal open and the computer awake. Run the same `init` command to
 resume after interruption; use `python main.py research status` from another
 terminal to see progress. To create a configuration without starting work, use

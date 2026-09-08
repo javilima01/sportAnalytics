@@ -1,11 +1,14 @@
 # Run: python main.py research init
 # This command starts/resumes the full workflow. Edit settings before first launch.
-campaign_id: football-pilot
-output_dir: experiments/football-pilot
-dataset_dir: datasets/football-pilot
+# Next campaign reuses the existing labeled dataset; original results are preserved.
+campaign_id: football-astra-high
+output_dir: experiments/football-astra-high
+dataset_dir: datasets/football-astra-high
 device: mps
 workers: 2
 codex_executable: codex
+codex_model: gpt-6-astra
+codex_reasoning_effort: high  # Set medium before first launch for lighter reasoning.
 fallback:
   enabled: true
   executable: opencode
@@ -19,7 +22,7 @@ names: [player, ball]
 acquisition:
   queries: ["football full match wide camera"]
   sources: []  # Codex selects real videos from YouTube search results.
-  max_sources: 6
+  max_sources: 12  # The imported dataset already has 12 source plans.
   max_frames_per_source: 12
   minutes: 30
   max_rounds: 3
@@ -27,6 +30,13 @@ acquisition:
   storage_gb: 20
   teacher: models/yolov8x.pt  # Annotation proposals; independent of student size.
   teacher_imgsz: 1280
+
+data_growth:
+  enabled: true
+  min_train_images: 48
+  max_rounds: 3
+  sources_per_round: 3
+  trials_per_round: 2
 
 # Strict gates apply to both macro scores and the ball class alone.
 evaluation:

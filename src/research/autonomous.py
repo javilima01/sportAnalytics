@@ -6,12 +6,15 @@ from datetime import datetime, timezone
 from .acquisition import acquire
 from .agent import ResearchAgent
 from .controller import ConfirmationIncomplete, finalize, freeze_dataset, initialize, run_campaign
+from .growth import explore_with_growth, grow_training
 from .manifest import InsufficientCoverage
 from .providers import ProvidersUnavailable, ProviderWaitExhausted
 from .runtime import read_json, run_process, save_json
 
 
-def run_autonomous(cfg, *, agent=None, executor=run_process, collector=acquire):
+def run_autonomous(
+    cfg, *, agent=None, executor=run_process, collector=acquire, grower=grow_training
+):
     """Resume stages under the caller's campaign lock; never expand configured budgets."""
     initialize(cfg)
     path = cfg.output_dir / "autonomous.json"
@@ -85,6 +88,8 @@ def run_autonomous(cfg, *, agent=None, executor=run_process, collector=acquire):
 
         # Only inadequate coverage permits more acquisition. Corruption/leakage remains an error.
         while True:
+            if workflow.get("growth_pending"):
+                break  # Finish the reserved append-only transaction before checking its new snapshot.
             if (cfg.output_dir / "snapshot.json").exists():
                 freeze_dataset(cfg)
                 break
@@ -95,6 +100,10 @@ def run_autonomous(cfg, *, agent=None, executor=run_process, collector=acquire):
                     break
                 except InsufficientCoverage as error:
                     coverage = str(error)
+            acquisition = read_json(cfg.output_dir / "acquisition.json", {})
+            if acquisition.get("stop_reason"):
+                record("acquire", f"{acquisition['stop_reason']} {coverage}", "stopped")
+                return workflow
             if workflow["acquisition_rounds"] >= cfg.acquisition.max_rounds:
                 record("acquire", f"Acquisition round limit reached. {coverage}", "stopped")
                 return workflow
@@ -111,6 +120,12 @@ def run_autonomous(cfg, *, agent=None, executor=run_process, collector=acquire):
             except (RuntimeError, TimeoutError, ValueError) as error:
                 record("acquire", f"Acquisition attempt failed: {error}")
 
+        if cfg.data_growth.enabled and "explore" not in workflow["completed_phases"]:
+            if not explore_with_growth(
+                cfg, workflow, record, with_provider_wait, agent, executor, grower
+            ):
+                return workflow
+
         for phase in ("explore", "promote", "confirm"):
             if phase in workflow["completed_phases"]:
                 continue
@@ -126,7 +141,11 @@ def run_autonomous(cfg, *, agent=None, executor=run_process, collector=acquire):
                 )
             )
             completed = [
-                r for r in state["trials"] if r["phase"] == phase and r["status"] == "completed"
+                r
+                for r in state["trials"]
+                if r["phase"] == phase
+                and r["status"] == "completed"
+                and r.get("dataset_version") == state.get("dataset_version")
             ]
             if not completed:
                 record(

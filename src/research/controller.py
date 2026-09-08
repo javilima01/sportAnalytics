@@ -2,6 +2,7 @@
 
 import csv
 import io
+import json
 import math
 import sys
 import time
@@ -32,7 +33,7 @@ def initialize(cfg):
     save_json(path, value)
 
 
-def freeze_dataset(cfg):
+def freeze_dataset(cfg, *, allow_training_growth=False):
     from ..dataset import read_names
 
     if list(read_names(cfg.dataset_dir / "data.yaml").values()) != cfg.names:
@@ -40,8 +41,31 @@ def freeze_dataset(cfg):
     snapshot = audit_dataset(cfg.dataset_dir, cfg.evaluation)
     path = cfg.output_dir / "snapshot.json"
     previous = read_json(path)
+    records = [
+        json.loads(line) for line in (cfg.dataset_dir / "manifest.jsonl").read_text().splitlines()
+    ]
+    versions = cfg.output_dir / "dataset_versions"
+    yaml_hash = file_hash(cfg.dataset_dir / "data.yaml")
     if previous is not None and previous != snapshot:
-        raise ValueError("Frozen dataset changed. Use a new campaign.")
+        if (
+            not allow_training_growth
+            or not cfg.data_growth.enabled
+            or (cfg.output_dir / "final_test.json").exists()
+        ):
+            raise ValueError("Frozen dataset changed. Use a new campaign.")
+        old = read_json(versions / f"{previous['version']}.json")
+        if not old or old["yaml_sha256"] != yaml_hash:
+            raise ValueError("Frozen dataset metadata changed.")
+        before = {r["image"]: r for r in old["records"]}
+        after = {r["image"]: r for r in records}
+        if any(after.get(key) != value for key, value in before.items()):
+            raise ValueError("Existing frozen images or labels changed during training growth.")
+        if any(r["split"] != "train" for key, r in after.items() if key not in before):
+            raise ValueError("Validation and test data cannot grow after freezing.")
+    save_json(
+        versions / f"{snapshot['version']}.json",
+        {"snapshot": snapshot, "yaml_sha256": yaml_hash, "records": records},
+    )
     save_json(path, snapshot)
     return snapshot
 
@@ -71,6 +95,7 @@ def write_results(directory, records):
         "status",
         "seconds",
         "decision",
+        "dataset_version",
         "parameters",
         "macro_ap50_95",
         "ball_ap50_95",
@@ -90,6 +115,7 @@ def write_results(directory, records):
                 "status": record["status"],
                 "seconds": record["seconds"],
                 "decision": record.get("decision", "invalid"),
+                "dataset_version": record.get("dataset_version"),
                 "parameters": metrics.get("parameters"),
                 "macro_ap50_95": metrics.get("macro", {}).get("ap50_95"),
                 "ball_ap50_95": metrics.get("ball", {}).get("ap50_95"),
@@ -140,6 +166,7 @@ def run_trial(cfg, state, recipe, phase, seed, timeout, executor=run_process):
         "status": "running",
         "seconds": 0,
         "reserved_seconds": timeout,
+        "dataset_version": read_json(cfg.output_dir / "snapshot.json", {}).get("version"),
     }
     state["trials"].append(record)
     persist(cfg, state)
@@ -187,7 +214,11 @@ def run_trial(cfg, state, recipe, phase, seed, timeout, executor=run_process):
             raise ValueError("Checkpoint is missing or has changed.")
         record.update(status="completed", metrics=metrics)
         completed = [
-            r for r in state["trials"] if r["phase"] == phase and r["status"] == "completed"
+            r
+            for r in state["trials"]
+            if r["phase"] == phase
+            and r["status"] == "completed"
+            and r.get("dataset_version") == record["dataset_version"]
         ]
         best = min(completed, key=rank)
         record["decision"] = "keep" if best["id"] == identity else "discard"
@@ -208,7 +239,14 @@ def run_trial(cfg, state, recipe, phase, seed, timeout, executor=run_process):
     return record
 
 
-def run_campaign(cfg, phase="explore", executor=run_process, agent=None, retry_interrupted=False):
+def run_campaign(
+    cfg,
+    phase="explore",
+    executor=run_process,
+    agent=None,
+    retry_interrupted=False,
+    phase_trial_limit=None,
+):
     initialize(cfg)
     if (cfg.output_dir / "final_test.json").exists():
         raise ValueError("Final test has been opened; this campaign is closed to further trials.")
@@ -216,7 +254,7 @@ def run_campaign(cfg, phase="explore", executor=run_process, agent=None, retry_i
         from .acquisition import acquire
 
         acquire(cfg, agent=agent)
-    freeze_dataset(cfg)
+    snapshot = freeze_dataset(cfg)
     fingerprint = source_fingerprint()
     previous = read_json(cfg.output_dir / "source_hashes.json")
     if previous is not None and previous != fingerprint:
@@ -225,17 +263,38 @@ def run_campaign(cfg, phase="explore", executor=run_process, agent=None, retry_i
         )
     save_json(cfg.output_dir / "source_hashes.json", fingerprint)
     state = load_state(cfg)
+    if state.get("dataset_version") != snapshot["version"]:
+        state.update(dataset_version=snapshot["version"], incumbents={})
     persist(cfg, state)
     agent = agent or ResearchAgent(cfg)
     if phase == "explore":
         queue = [(recipe, 0) for recipe in cfg.recipes]
+        previous_exploration = [
+            r for r in state["trials"] if r["phase"] == "explore" and r["status"] == "completed"
+        ]
+        if cfg.data_growth.enabled and previous_exploration:
+            best_recipe = min(previous_exploration, key=rank)["recipe"]
+            tested_models = {r["recipe"]["model"] for r in previous_exploration}
+            queue.sort(
+                key=lambda item: (
+                    0
+                    if item[0].model_dump() == best_recipe
+                    else 1
+                    if item[0].model not in tested_models
+                    else 2
+                )
+            )
         minutes = cfg.budget.exploration_minutes
     else:
         parent_phase = (
             "promote" if phase == "confirm" and "promote" in state["incumbents"] else "explore"
         )
         parents = [
-            r for r in state["trials"] if r["phase"] == parent_phase and r["status"] == "completed"
+            r
+            for r in state["trials"]
+            if r["phase"] == parent_phase
+            and r["status"] == "completed"
+            and r.get("dataset_version") == snapshot["version"]
         ]
         if not parents:
             raise ValueError(f"No completed {parent_phase} candidate to promote.")
@@ -247,17 +306,22 @@ def run_campaign(cfg, phase="explore", executor=run_process, agent=None, retry_i
             cfg.budget.confirmation_minutes if phase == "confirm" else cfg.budget.promotion_minutes
         )
     attempted = {
-        (r["phase"], value_hash(r["recipe"]), r["seed"])
+        (r["phase"], value_hash(r["recipe"]), r["seed"], r.get("dataset_version"))
         for r in state["trials"]
         if not (retry_interrupted and r["status"] == "interrupted")
     }
     queue = [
         (recipe, seed)
         for recipe, seed in queue
-        if (phase, value_hash(recipe.model_dump()), seed) not in attempted
+        if (phase, value_hash(recipe.model_dump()), seed, snapshot["version"]) not in attempted
     ]
     proposal_index = len(list((cfg.output_dir / "proposals").glob("*")))
     while len(state["trials"]) < cfg.budget.max_trials:
+        if (
+            phase_trial_limit is not None
+            and sum(r["phase"] == phase for r in state["trials"]) >= phase_trial_limit
+        ):
+            break
         if (
             phase == "explore"
             and sum(r["phase"] == "explore" for r in state["trials"])
@@ -314,7 +378,7 @@ def run_campaign(cfg, phase="explore", executor=run_process, agent=None, retry_i
 
 def finalize(cfg, executor=run_process):
     initialize(cfg)
-    freeze_dataset(cfg)
+    snapshot = freeze_dataset(cfg)
     if read_json(cfg.output_dir / "source_hashes.json") != source_fingerprint():
         raise ValueError("Experiment code changed; final testing requires the frozen evaluator.")
     marker = cfg.output_dir / "final_test.json"
@@ -331,6 +395,7 @@ def finalize(cfg, executor=run_process):
             trial["phase"] == "confirm"
             and trial["status"] == "completed"
             and trial["metrics"]["feasible"]
+            and trial.get("dataset_version") == snapshot["version"]
         ):
             candidates.setdefault(value_hash(trial["recipe"]), {})[trial["seed"]] = trial
     eligible = [seeds for seeds in candidates.values() if set(seeds) == {0, 1, 2}]

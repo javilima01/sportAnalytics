@@ -172,3 +172,39 @@ def test_missing_runtime_reports_installation_help(tmp_path, model, monkeypatch)
     monkeypatch.setattr("src.creation.shutil.which", lambda *args, **kwargs: None)
     with pytest.raises(RuntimeError, match="Install requirements.txt"):
         creator._download_youtube("https://example.com/video", tmp_path)
+
+
+def test_clip_download_bounds_time_and_resolution(tmp_path, monkeypatch):
+    run = Mock()
+    monkeypatch.setattr("src.creation.subprocess.run", run)
+    monkeypatch.setattr("src.creation.shutil.which", lambda *a, **k: "/bin/deno")
+    monkeypatch.setattr("imageio_ffmpeg.get_ffmpeg_exe", lambda: "/bin/ffmpeg")
+    DatasetCreator._download_youtube(
+        None, "https://example.com/video", tmp_path, section=(1200, 1320), max_height=1280
+    )
+    command = run.call_args.args[0]
+    assert command[command.index("--download-sections") + 1] == "*1200-1320"
+    assert command[command.index("--ffmpeg-location") + 1] == "/bin/ffmpeg"
+    assert "--force-keyframes-at-cuts" in command
+    assert "--ignore-config" in command
+    # Exercise yt-dlp's selector: a high-resolution stream must not bypass the cap.
+    with YoutubeDL({"format": command[command.index("-f") + 1], "quiet": True}) as downloader:
+        info = downloader.process_ie_result(
+            {
+                "id": "test",
+                "title": "test",
+                "formats": [
+                    {
+                        "format_id": str(height),
+                        "height": height,
+                        "url": f"https://example.com/{height}.mp4",
+                        "ext": "mp4",
+                        "vcodec": "avc1.4d400c",
+                        "acodec": "none",
+                    }
+                    for height in (720, 1080, 2160)
+                ],
+            },
+            download=False,
+        )
+    assert info["format_id"] == "1080"

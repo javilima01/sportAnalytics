@@ -62,7 +62,7 @@ class DatasetCreator:
                 (self.output_dir / kind / split).mkdir(parents=True, exist_ok=True)
         self._write_yaml()
 
-    def _download_youtube(self, url, directory):
+    def _download_youtube(self, url, directory, *, section=None, max_height=None):
         output = Path(directory) / "video.mp4"
         # Find the runtime beside Python even when the virtualenv is not activated.
         runtime = shutil.which("deno", path=str(Path(sys.executable).parent)) or shutil.which(
@@ -70,20 +70,39 @@ class DatasetCreator:
         )
         if runtime is None:
             raise RuntimeError("YouTube downloading requires Deno. Install requirements.txt first.")
+        formats = "bestvideo[ext=mp4][vcodec^=avc1]/best[ext=mp4]/bestvideo[ext=mp4]"
+        if max_height is not None:
+            if not isinstance(max_height, int) or max_height <= 0:
+                raise ValueError("Download height must be a positive integer.")
+            formats = "/".join(f"{item}[height<={max_height}]" for item in formats.split("/"))
         command = [
             sys.executable,
             "-m",
             "yt_dlp",
+            "--ignore-config",
             "--no-playlist",
             "--js-runtimes",
             f"deno:{runtime}",
             "-f",
             # No audio/merging is needed; prefer H.264 for OpenCV compatibility.
-            "bestvideo[ext=mp4][vcodec^=avc1]/best[ext=mp4]/bestvideo[ext=mp4]",
+            formats,
             "-o",
             str(output),
-            url,
         ]
+        if section is not None:
+            start, end = section
+            if not all(math.isfinite(v) for v in section) or not 0 <= start < end:
+                raise ValueError("Download section requires finite seconds with 0 <= start < end.")
+            from imageio_ffmpeg import get_ffmpeg_exe
+
+            command += [
+                "--ffmpeg-location",
+                get_ffmpeg_exe(),
+                "--download-sections",
+                f"*{start:g}-{end:g}",
+                "--force-keyframes-at-cuts",
+            ]
+        command.append(url)
         try:
             subprocess.run(command, check=True, capture_output=True, text=True)
         except subprocess.CalledProcessError as error:

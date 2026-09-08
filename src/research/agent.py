@@ -106,6 +106,8 @@ class CodexAgent:
         ]
         if self.cfg.codex_model:
             command += ["--model", self.cfg.codex_model]
+        if self.cfg.codex_reasoning_effort:
+            command += ["--config", f'model_reasoning_effort="{self.cfg.codex_reasoning_effort}"']
         for image in images:
             command += ["--image", str(Path(image).resolve())]
         command += ["-"]
@@ -340,6 +342,9 @@ class ResearchAgent(CodexAgent):
                     "model": self.cfg.fallback.model
                     if provider == "opencode"
                     else self.cfg.codex_model,
+                    "reasoning_effort": self.cfg.codex_reasoning_effort
+                    if provider == "codex"
+                    else None,
                     "record": str(attempt),
                 },
             )

@@ -3,6 +3,7 @@
 import json
 import math
 import os
+import platform
 import re
 import shutil
 import subprocess
@@ -29,25 +30,46 @@ class ProviderWaitExhausted(RuntimeError):
     pass
 
 
+def bundled_codex():
+    """Find the newest native macOS editor bundle without relying on the IDE's PATH."""
+    architecture = {"arm64": "aarch64", "x86_64": "x86_64"}.get(platform.machine())
+    if platform.system() != "Darwin" or architecture is None:
+        return None
+    candidates = []
+    for editor in (".vscode", ".vscode-insiders", ".cursor"):
+        extensions = Path.home() / editor / "extensions"
+        for path in extensions.glob(f"openai.chatgpt-*/bin/macos-{architecture}/codex"):
+            version = re.fullmatch(r"openai\.chatgpt-(\d+(?:\.\d+)*)(?:-.*)?", path.parents[2].name)
+            if version and path.is_file() and os.access(path, os.X_OK):
+                candidates.append((tuple(map(int, version[1].split("."))), str(path)))
+    return max(candidates)[1] if candidates else None
+
+
 def executable_path(name):
-    """Also find executables added by interactive shell startup, e.g. nvm."""
+    """Prefer PATH, then interactive shell startup, then the installed Codex editor bundle."""
     found = shutil.which(name)
     if found:
         return found
     if not re.fullmatch(r"[a-zA-Z0-9_-]+", name):
         raise RuntimeError(f"Executable not found: {name}")
     shell = os.environ.get("SHELL", "/bin/zsh")
-    result = subprocess.run(
-        [shell, "-lic", 'command -v -- "$1"', "research", name],
-        capture_output=True,
-        text=True,
-        timeout=10,
-        check=False,
-    )
-    for line in reversed(result.stdout.splitlines()):
+    try:
+        result = subprocess.run(
+            [shell, "-lic", 'command -v -- "$1"', "research", name],
+            capture_output=True,
+            text=True,
+            timeout=10,
+            check=False,
+        )
+        lines = result.stdout.splitlines()
+    except (OSError, subprocess.TimeoutExpired):
+        lines = []
+    for line in reversed(lines):
         path = Path(line.strip())
         if path.is_absolute() and path.is_file() and os.access(path, os.X_OK):
             return str(path)
+    if name == "codex" and (found := bundled_codex()):
+        return found
     raise RuntimeError(f"Executable not found: {name}. Set its full path in research.yaml.")
 
 
