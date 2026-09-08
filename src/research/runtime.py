@@ -6,7 +6,7 @@ import os
 import signal
 import subprocess
 import time
-from contextlib import contextmanager, suppress
+from contextlib import ExitStack, contextmanager, suppress
 from pathlib import Path
 
 from ..dataset import atomic_write
@@ -60,7 +60,16 @@ def tree_bytes(directory):
 
 
 def run_process(
-    command, *, timeout, log, cwd=None, stdin=None, watch_dir=None, max_bytes=None, env=None
+    command,
+    *,
+    timeout,
+    log,
+    cwd=None,
+    stdin=None,
+    watch_dir=None,
+    max_bytes=None,
+    env=None,
+    progress_log=None,
 ):
     """Kill the whole child process group on deadline, storage overflow, or interruption."""
     if timeout <= 0:
@@ -68,7 +77,20 @@ def run_process(
     log = Path(log)
     log.parent.mkdir(parents=True, exist_ok=True)
     start = time.monotonic()
-    with log.open("w") as output:
+    with ExitStack() as stack:
+        output = stack.enter_context(log.open("w"))
+        progress = None
+        if progress_log is not None:
+            progress_log = Path(progress_log)
+            progress_log.parent.mkdir(parents=True, exist_ok=True)
+            progress = stack.enter_context(progress_log.open("w+"))
+
+        def forward_progress():
+            if progress is not None:
+                text = progress.read()
+                if text:
+                    print(text, end="", flush=True)
+
         process = subprocess.Popen(
             command,
             cwd=cwd,
@@ -84,6 +106,7 @@ def run_process(
                 process.stdin.write(stdin)
                 process.stdin.close()
             while process.poll() is None:
+                forward_progress()
                 if time.monotonic() - start >= timeout:
                     raise TimeoutError(f"Process exceeded {timeout:.1f} seconds; see {log}.")
                 if (
@@ -114,4 +137,5 @@ def run_process(
             # A child may outlive a terminated parent, including by ignoring SIGTERM.
             with suppress(ProcessLookupError):
                 os.killpg(process.pid, signal.SIGKILL)
+            forward_progress()
     return time.monotonic() - start

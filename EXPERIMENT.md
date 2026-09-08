@@ -99,6 +99,16 @@ is safe during a run. Follow detailed output in each operation's `run.log` or
 `agent.log`; `results.csv` and `state.json` track trials. `autonomous.json` records
 the current stage, completed phases, acquisition rounds, decisions and final outcome.
 
+During training the terminal shows the model and device, each completed epoch's
+losses and Ultralytics validation metrics, elapsed time and remaining training
+budget. Long epochs also report batch progress every 30 seconds at batch boundaries.
+After training, a separate validation summary reports the campaign's macro and ball
+scores; those final scores determine acceptance. The concise output is saved in
+each trial's `progress.log`, while `run.log` retains the full training output.
+From another terminal, use `tail -f experiments/<campaign>/trial-0001/progress.log`
+to follow a particular trial. Epoch and time limits are ceilings: early stopping
+can finish training sooner.
+
 ### Automatic provider fallback
 
 The configured primary agent is `codex_model: gpt-6-astra` with

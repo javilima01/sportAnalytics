@@ -200,6 +200,7 @@ def run_trial(cfg, state, recipe, phase, seed, timeout, executor=run_process):
             timeout=timeout,
             log=folder / "run.log",
             cwd=ROOT,
+            progress_log=folder / "progress.log",
         )
         metrics = read_json(folder / "metrics.json")
         if not isinstance(metrics, dict):

@@ -34,7 +34,7 @@ acquisition:
 data_growth:
   enabled: true
   min_train_images: 48
-  max_rounds: 3
+  max_rounds: 10
   sources_per_round: 3
   trials_per_round: 2
 

@@ -13,6 +13,7 @@ from ultralytics import YOLO
 
 from .config import Campaign, Recipe
 from .evaluation import evaluate
+from .progress import TrainingProgress
 from .runtime import file_hash, read_json, save_json
 
 
@@ -23,6 +24,13 @@ def train_job(job):
     model = YOLO(recipe.model)
     start = time.monotonic()
     training_seconds = job["training_seconds"]
+    progress = TrainingProgress(folder, training_seconds)
+    progress.write(
+        f"starting {recipe.id} ({recipe.model}), device={cfg.device}, "
+        f"imgsz={recipe.imgsz}, seed={job['seed']}, "
+        f"up to {recipe.epochs} epochs / {training_seconds / 60:.1f} min training"
+    )
+    progress.attach(model)
 
     def stop_at_budget(trainer):
         if time.monotonic() - start >= training_seconds:
@@ -53,6 +61,7 @@ def train_job(job):
     # Reload so parameter count is measured before prediction fuses layers.
     best = YOLO(str(checkpoint))
     parameters = sum(p.numel() for p in best.model.parameters())
+    progress.write("training finished; evaluating best.pt on validation images")
     metrics, frames = evaluate(
         best, cfg.dataset_dir, "val", cfg.evaluation, cfg.device, recipe.imgsz
     )
@@ -67,6 +76,12 @@ def train_job(job):
     )
     save_json(folder / "predictions.json", frames)
     save_json(folder / "metrics.json", metrics)
+    progress.write(
+        f"validation complete | macro AP50-95={metrics['macro']['ap50_95']:.4f}, "
+        f"ball AP50-95={metrics['ball']['ap50_95']:.4f}, "
+        f"ball precision={metrics['ball']['precision']:.4f}, "
+        f"ball recall={metrics['ball']['recall']:.4f} | checkpoint={checkpoint}"
+    )
 
 
 def test_job(job):

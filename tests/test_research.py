@@ -617,6 +617,76 @@ def test_storage_budget_checks_fast_processes(tmp_path):
         )
 
 
+@pytest.mark.parametrize("outcome", ["completed", "failed", "timeout"])
+def test_process_forwards_progress_live_and_keeps_full_log(tmp_path, monkeypatch, outcome):
+    import builtins
+
+    progress = tmp_path / "progress.log"
+    finished = tmp_path / "finished"
+    messages = []
+
+    def capture(text, **kwargs):
+        messages.append((text, finished.exists()))
+
+    monkeypatch.setattr(builtins, "print", capture)
+    script = (
+        "from pathlib import Path; import time, sys; "
+        "print('full diagnostic output', flush=True); "
+        "Path('progress.log').write_text('epoch 1 complete\\n'); "
+        "time.sleep(0.5); "
+        "Path('finished').touch(); "
+        "Path('progress.log').open('a').write('validation complete\\n'); "
+        f"sys.exit({1 if outcome == 'failed' else 0})"
+    )
+    kwargs = dict(
+        timeout=0.3 if outcome == "timeout" else 5,
+        log=tmp_path / "run.log",
+        progress_log=progress,
+        cwd=tmp_path,
+    )
+    if outcome == "completed":
+        run_process([sys.executable, "-c", script], **kwargs)
+    else:
+        with pytest.raises(TimeoutError if outcome == "timeout" else RuntimeError):
+            run_process([sys.executable, "-c", script], **kwargs)
+    assert messages[0] == ("epoch 1 complete\n", False)
+    assert "".join(text for text, _ in messages) == progress.read_text()
+    assert (tmp_path / "run.log").read_text() == "full diagnostic output\n"
+
+
+def test_training_progress_throttles_batches_and_avoids_duplicate_epochs(tmp_path, monkeypatch):
+    from types import SimpleNamespace
+
+    from src.research.progress import TrainingProgress
+
+    clock = [0.0]
+    monkeypatch.setattr("src.research.progress.time.monotonic", lambda: clock[0])
+    progress = TrainingProgress(tmp_path, 120)
+    trainer = SimpleNamespace(
+        epoch=0,
+        epochs=5,
+        train_loader=[None] * 3,
+        tloss=[0.5],
+        label_loss_items=lambda loss, prefix: {f"{prefix}/box_loss": loss[0]},
+        metrics={"metrics/mAP50-95(B)": 0.25},
+    )
+    progress.epoch_start(trainer)
+    clock[0] = 29
+    progress.batch_end(trainer)
+    assert not progress.path.exists()
+    clock[0] = 30
+    progress.batch_end(trainer)
+    assert "batch 2/3" in progress.path.read_text()
+    clock[0] = 60
+    progress.epoch_end(trainer)
+    progress.epoch_end(trainer)
+    text = progress.path.read_text()
+    assert text.count("epoch 1/5 complete") == 1
+    assert "train/box_loss=0.5000" in text
+    assert "metrics/mAP50-95(B)=0.2500" in text
+    assert "training budget remaining 1.0 min" in text
+
+
 def test_research_cli_init_and_status(tmp_path, capsys):
     from main import parse_args, run_research
 
@@ -1000,7 +1070,7 @@ def test_acquisition_uses_agent_boxes_and_resumes(tmp_path):
 
 @pytest.mark.integration
 @pytest.mark.parametrize("device", ["cpu", "mps"])
-def test_real_research_worker_training_and_evaluation(campaign, device):
+def test_real_research_worker_training_and_evaluation(campaign, device, capsys):
     import torch
     from ultralytics import YOLO
 
@@ -1021,6 +1091,14 @@ def test_real_research_worker_training_and_evaluation(campaign, device):
     assert trial["status"] == "completed", log.read_text()
     assert trial["metrics"]["epochs_completed"] == 1
     assert trial["metrics"]["parameters"] > 0
+    progress = log.with_name("progress.log").read_text()
+    assert "starting baseline" in progress
+    assert "epoch 1/1 complete" in progress
+    assert "train/box_loss=" in progress
+    assert "training finished; evaluating best.pt" in progress
+    assert "validation complete | macro AP50-95=" in progress
+    assert "ball recall=" in progress
+    assert progress in capsys.readouterr().out
     folder = campaign.output_dir / "test-smoke"
     folder.mkdir()
     test_job(
