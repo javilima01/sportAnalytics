@@ -133,16 +133,23 @@ def acceptance(metrics, cfg):
     return {"feasible": not failures, "failures": failures, "progress": min(ratios)}
 
 
-def evaluate(model, dataset, split, cfg, device, imgsz, confidence=None):
+def evaluate(model, dataset, split, cfg, device, imgsz, confidence=None, *, image_paths=None):
     names = read_names(Path(dataset) / "data.yaml")
     if model.names != names:
         raise ValueError("Model classes differ from the evaluation taxonomy.")
     frames = []
-    image_paths = sorted(
+    available = sorted(
         p
         for p in (Path(dataset) / "images" / split).iterdir()
         if p.suffix.lower() in IMAGE_SUFFIXES
     )
+    if image_paths is None:
+        image_paths = available
+    else:
+        image_paths = [Path(p) for p in image_paths]
+        allowed = {p.resolve() for p in available}
+        if not image_paths or any(p.resolve() not in allowed for p in image_paths):
+            raise ValueError("Evaluation subset must contain only images from its requested split.")
     for path in image_paths:
         image = cv2.imread(str(path))
         if image is None:

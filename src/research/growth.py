@@ -7,7 +7,7 @@ from pydantic import Field
 
 from .acquisition import acquire, discover
 from .config import Settings, Source
-from .controller import freeze_dataset, load_state, rank, run_campaign
+from .controller import freeze_dataset, load_state, rank, remaining_seconds, run_campaign
 from .providers import ProviderWaitExhausted
 from .runtime import read_json, save_json, tree_bytes
 
@@ -152,8 +152,7 @@ def explore_with_growth(cfg, workflow, record, wait, agent, executor, grower=gro
         trial_room = (
             len(explored) < cfg.budget.max_exploration_trials
             and len(state["trials"]) < cfg.budget.max_trials
-            and cfg.budget.max_hours * 3600 - sum(r["seconds"] for r in state["trials"])
-            >= cfg.budget.exploration_minutes * 60
+            and remaining_seconds(cfg, state) >= cfg.budget.exploration_minutes * 60
         )
         acquisition = read_json(cfg.output_dir / "acquisition.json", {})
         data_room = (

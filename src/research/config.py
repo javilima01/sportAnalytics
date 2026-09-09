@@ -117,6 +117,15 @@ class DataGrowth(Settings):
     trials_per_round: int = Field(2, ge=1)
 
 
+class Diagnostics(Settings):
+    enabled: bool = True
+    max_actions: int = Field(12, ge=0, le=100)
+    minutes: float = Field(5, gt=0, le=15)
+    max_minutes: float = Field(30, gt=0)
+    max_images: int = Field(16, ge=2, le=64)
+    max_decisions: int = Field(32, ge=1, le=200)
+
+
 class Campaign(Settings):
     campaign_id: str = Field("football-pilot", pattern=r"^[a-zA-Z0-9_-]+$")
     output_dir: Path = Path("experiments/football-pilot")
@@ -138,6 +147,7 @@ class Campaign(Settings):
     evaluation: Evaluation = Field(default_factory=Evaluation)
     budget: Budget = Field(default_factory=Budget)
     data_growth: DataGrowth = Field(default_factory=DataGrowth)
+    diagnostics: Diagnostics = Field(default_factory=Diagnostics)
     recipes: list[Recipe] = Field(
         default_factory=lambda: [
             Recipe(id="nano640", hypothesis="Establish a small-model baseline."),

@@ -120,10 +120,15 @@ def run_autonomous(
             except (RuntimeError, TimeoutError, ValueError) as error:
                 record("acquire", f"Acquisition attempt failed: {error}")
 
-        if cfg.data_growth.enabled and "explore" not in workflow["completed_phases"]:
-            if not explore_with_growth(
-                cfg, workflow, record, with_provider_wait, agent, executor, grower
-            ):
+        adaptive = cfg.diagnostics.enabled and cfg.proposals == "codex"
+        if (cfg.data_growth.enabled or adaptive) and "explore" not in workflow["completed_phases"]:
+            if adaptive:
+                from .adaptive import explore_adaptively
+
+                explorer = explore_adaptively
+            else:
+                explorer = explore_with_growth
+            if not explorer(cfg, workflow, record, with_provider_wait, agent, executor, grower):
                 return workflow
 
         for phase in ("explore", "promote", "confirm"):
@@ -135,11 +140,15 @@ def run_autonomous(
                 "confirm": "Training the selected recipe with seeds 0, 1, and 2.",
             }
             record(phase, reasons[phase])
-            state = with_provider_wait(
-                lambda: run_campaign(
-                    cfg, phase=phase, executor=executor, agent=agent, retry_interrupted=True
+            try:
+                state = with_provider_wait(
+                    lambda: run_campaign(
+                        cfg, phase=phase, executor=executor, agent=agent, retry_interrupted=True
+                    )
                 )
-            )
+            except ConfirmationIncomplete as error:
+                record(phase, str(error), "stopped")
+                return workflow
             completed = [
                 r
                 for r in state["trials"]

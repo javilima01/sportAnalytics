@@ -177,6 +177,46 @@ def test_autonomous_quality_failure_keeps_test_unopened(campaign):
     assert result["status"] == "stopped" and result["stage"] == "confirm"
     assert "final test remains unopened" in result["reason"]
     assert not (campaign.output_dir / "final_test.json").exists()
+    trials = read_json(campaign.output_dir / "state.json")["trials"]
+    assert [r["phase"] for r in trials] == ["explore", "promote"]
+    with pytest.raises(ValueError, match="passing every quality gate"):
+        run_campaign(campaign, phase="confirm", executor=weak_worker)
+
+
+def test_failed_confirmation_still_keeps_test_unopened(campaign):
+    from src.research.autonomous import run_autonomous
+
+    def worker(command, **kwargs):
+        job = read_json(command[-1])
+        metrics = good_metrics(Path(job["recipe"]["model"]))
+        if job["seed"] == 2:
+            metrics["ball"]["recall"] = 0.2
+        save_json(Path(job["folder"]) / "metrics.json", metrics)
+
+    result = run_autonomous(campaign, agent=ReadyAgent(), executor=worker)
+    assert result["status"] == "stopped" and result["stage"] == "confirm"
+    assert not (campaign.output_dir / "final_test.json").exists()
+    trials = read_json(campaign.output_dir / "state.json")["trials"]
+    assert [r["seed"] for r in trials if r["phase"] == "confirm"] == [0, 1, 2]
+
+
+def test_zero_ball_scores_do_not_hide_other_detection_improvements(campaign):
+    campaign.recipes.append(
+        campaign.recipes[0].model_copy(update={"id": "higher-resolution", "imgsz": 960})
+    )
+    (campaign.output_dir / "contract.json").unlink()
+
+    def worker(command, **kwargs):
+        job = read_json(command[-1])
+        metrics = good_metrics(Path(job["recipe"]["model"]))
+        metrics["ball"] = dict.fromkeys(metrics["ball"], 0.0)
+        metrics["macro"].update(ap50_95=0.32 if job["recipe"]["imgsz"] == 960 else 0.25)
+        save_json(Path(job["folder"]) / "metrics.json", metrics)
+
+    state = run_campaign(campaign, executor=worker)
+    assert state["incumbents"]["explore"] == "trial-0002"
+    state = run_campaign(campaign, phase="promote", executor=worker)
+    assert state["trials"][-1]["recipe"]["imgsz"] == 960
 
 
 def test_autonomous_does_not_collect_over_corrupted_data(campaign):

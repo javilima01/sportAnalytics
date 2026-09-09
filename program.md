@@ -16,6 +16,17 @@ promotes the best recipe, trains seeds 0/1/2, and opens the final test only when
 three pass. It records decisions in `autonomous.json` and metrics in `results.csv`.
 No user input is needed between stages.
 
+With `diagnostics.enabled` and `proposals: codex`, direct exploration through the
+persisted decision loop. Inspect its initial label/size/augmentation evidence,
+then choose training, a diagnostic, targeted acquisition, finishing exploration,
+or stopping. Do not exhaust preset recipes before adjusting a failing small model.
+Diagnose repeated zero ball scores: inspect train/val ball crops and object sizes,
+compare sampled training fit with validation, or request the bounded crop learning
+check. Treat crop memorization as a software/learning diagnostic, never as evidence
+of deployment accuracy. Read `decisions/` and `diagnostics/` for prior evidence;
+avoid repeating answered questions. All diagnostic runtime counts against its
+separate cap and the total compute allowance. Keep the test sealed.
+
 With `data_growth.enabled`, reach the training-image minimum, then alternate short
 trial batches with validation-guided searches and agent labeling of new training
 matches. Keep validation/test fixed and never reuse their matches for training.
@@ -27,7 +38,7 @@ those stages. Do not reset budgets to force another collection round.
 
 Keep the objective fixed: minimize student parameters subject to every macro and
 ball threshold in `EXPERIMENT.md`. Extra accuracy does not outweigh smaller size
-once both candidates pass. The YOLOv8-L annotation teacher is independent of the
+once both candidates pass. The configured annotation teacher is independent of the
 N/S/M/L/X student search; never force the deployment model to match the teacher.
 Teacher proposals still require agent correction. Do not relax quality gates.
 

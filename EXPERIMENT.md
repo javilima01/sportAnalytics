@@ -38,8 +38,9 @@ use it. Paths resolve relative to the configuration file.
 ### How decisions are made
 
 The Python orchestrator in `src/research/autonomous.py` selects the next stage from
-saved state and measured results. Codex makes the choices within that stage through
-the prompts in `src/research/agent.py` and `src/research/acquisition.py`. `program.md`
+saved state and measured results. With `diagnostics.enabled: true` and
+`proposals: codex`, the agent directs exploration through `src/research/adaptive.py`.
+The agent also selects videos and annotates frames. `program.md`
 documents the protocol; it is not a script that runs itself.
 
 | Condition | Automatic action |
@@ -47,10 +48,15 @@ documents the protocol; it is not a script that runs itself.
 | No adequate dataset | Search/select videos, download, sample and let Codex label images; retry within acquisition limits |
 | Dataset passes integrity and coverage checks | Freeze validation/test and version the initial training set |
 | Training set has fewer than `data_growth.min_train_images` | Search and label additional training matches within growth budgets before trials |
-| Exploration has trials available | Run at most `data_growth.trials_per_round` short trials, then assess validation results |
-| Quality gates fail, or a smaller tested student still fails | Ask the agent for targeted training-video searches, append accepted training labels, audit a new dataset version, and resume trials |
+| Training minimum met | Run an initial inspection of labels, ball sizes, and sampled augmentation |
+| A trial/diagnostic/collection action finishes | Ask the agent to choose the next action using all recorded evidence |
+| Agent chooses training | Execute its validated recipe immediately, ahead of unused presets |
+| Agent chooses diagnosis | Inspect data/crops, evaluate sampled training predictions, or run a bounded crop memorization check |
+| Agent chooses targeted collection | Execute its search queries, append accepted training labels, and audit a new dataset version |
+| Agent chooses to stop | Preserve its reason and results without promotion or final testing |
 | Exploration finishes with a candidate | Promote the best candidate with a 30-minute budget |
-| Promotion finishes with a candidate | Train the selected recipe with seeds 0/1/2 and longer budgets |
+| Promoted candidate passes every quality gate | Train the selected recipe with seeds 0/1/2 and longer budgets |
+| Promoted candidate still fails a quality gate | Stop before confirmation and preserve the failure evidence |
 | All three confirmation seeds pass | Evaluate seed 0 once on test and report the artifact |
 | Budgets exhausted or confirmation fails | Stop with a saved reason and preserve results; leave test unopened unless already finalized |
 
@@ -60,7 +66,7 @@ always ranks ahead of an infeasible one; among feasible models, fewer parameters
 are preferred. Autonomy does not guarantee that the pilot data and budget can
 produce a model meeting every quality target.
 
-With `data_growth.enabled: true` (the default), collection and exploration alternate.
+With `data_growth.enabled: true` (the default), the agent can interleave collection and exploration.
 The minimum training set is 48 accepted images. Up to three additional data rounds
 may select at most three new matches each, sharing the original 10 GB download and
 20 GB storage limits with initial acquisition. Each round has a 30-minute active
@@ -69,8 +75,10 @@ the same persisted cooldown rules. Initial acquisition retains its separate
 three-round coverage allowance. If the training minimum remains unmet when budgets
 run out, stop; never silently train the tiny recovery set as a finished dataset.
 
-After each two-trial batch, fixed validation metrics guide search hypotheses. The
-agent receives macro/ball/per-class validation scores and failed gates, never test
+After each action, fixed validation metrics and diagnostic outcomes guide the next
+decision. The agent receives macro/ball/per-class scores, failed gates, training and
+validation class counts, and saved diagnostics. Data inspection supplies labeled
+ball crop montages from train/val for visual review, never held-out test images or
 results. Aggregate scores suggest hypotheses; they do not prove which camera or
 weather conditions caused errors. Discovery excludes known videos/matches and only
 accepts `split: train`; identifying alternate edits still relies on agent metadata
@@ -84,11 +92,35 @@ An interrupted round resumes its recorded plan without spending another round or
 relabeling accepted frames. Ordinary failed data rounds are recorded and bounded;
 corrupted data stop the workflow.
 
-After growth, retry the strongest prior baseline recipe, then prioritize untested
-model sizes. Trial attempts and runtime remain cumulative across all data versions.
+After growth, the agent chooses whether to retest a baseline or adjust a recipe.
+Trial attempts and runtime remain cumulative across all data versions.
 Promotion and confirmation use only the current version. Training data stop growing
 when exploration finishes; all confirmation seeds must pass on that version before
 the single final test. Set `data_growth.enabled: false` for a fixed-dataset campaign.
+
+Diagnostics are isolated subprocesses with deadlines. Defaults allow 12 attempts,
+five minutes per attempt, 30 total diagnostic minutes, at most 16 sampled images,
+and 32 agent decisions. Diagnostic runtime also consumes `budget.max_hours`.
+Diagnostic attempts have their own ledger and do not consume candidate-trial slots.
+`inspect_data` summarizes all train/val labels and samples actual training transforms;
+its grid-center check assumes the configured YOLOv8 heads with strides 8/16/32.
+`evaluate_train` compares a ball-prioritized training sample with recorded validation
+scores. `overfit_crops` deliberately fits and scores the same training crops to test
+learning; its checkpoint and metrics can never become a campaign candidate.
+
+`decisions/decision-*/` stores evidence, prompts/provider responses, selected actions,
+execution reservations, and outcomes. `diagnostics/` stores diagnostic artifacts and
+the time ledger. Interrupted diagnostics are charged their reserved deadline and
+are not automatically repeated. A saved training action is not executed twice;
+the agent can choose a new attempt after interruption within the remaining budget.
+Invalid actions return an explicit reason to the agent and consume a decision slot.
+Quota waits resume the same pending decision. Frozen labels, quality gates, code,
+and test data remain protected; diagnostics do not silently repair benchmark labels.
+
+Set `diagnostics.enabled: false` to use the earlier preset queue and automatic
+growth after `data_growth.trials_per_round` trials. `proposals: queue` also disables
+agent-directed diagnostics. In adaptive mode that batch-size setting is unused:
+the agent decides after every action, including every trial.
 
 Accepted images and completed trials are not repeated. Autonomous resume can
 launch a fresh attempt for an interrupted trial, retaining and charging the old
@@ -300,7 +332,9 @@ for the final test. No per-class or test-derived threshold tuning.
 
 Among feasible candidates prefer fewer model parameters (counted before prediction
 layer fusion), then lower measured p95 latency, then smaller checkpoints. Among
-infeasible candidates rank the worst quality-to-threshold ratio, then ball AP50–95.
+infeasible candidates rank the worst quality-to-threshold ratio, then ball AP50–95,
+macro AP50–95, and macro F1. The macro tie-breakers retain measured improvements
+when every candidate has zero ball AP, instead of selecting by trial age.
 An infeasible candidate never replaces a feasible incumbent. Exploration and
 promotion have separate incumbents because their training budgets differ.
 
@@ -315,10 +349,10 @@ a pilot with few unique frames is not a deployment benchmark.
 Codex proposes validated recipe fields: starting checkpoint, image size, batch,
 epochs, learning rate, optimizer, mosaic, scale and rotation. Proposals may use
 only checkpoint paths in the original recipe list. Defaults compare YOLOv8n at
-640 and 960, followed by YOLOv8s/m/l/x at 640. With a fixed dataset these six baseline
-trials leave two agent-proposed trials within the default eight-trial exploration
-budget. With data growth, retraining uses the same eight-attempt allowance, so not
-all sizes or proposals are guaranteed to run. The agent
+640 and 960, plus YOLOv8s/m/l/x at 640. In adaptive mode these are starting suggestions,
+not a queue the agent must exhaust. It may adjust a small student's resolution or
+augmentation before trying larger models. The default eight-trial exploration
+allowance includes retesting after data growth, so not all sizes are guaranteed to run. The agent
 can tune any of those student sizes; teacher selection does not restrict them.
 The objective is minimum measured student parameters subject to **every** fixed
 macro/ball gate, not maximum accuracy regardless of size. Extra accuracy never
@@ -339,8 +373,10 @@ edits outside the controlled training-growth protocol.
 ## Confirmation and final artifact
 
 Promotion selects the best explored recipe. Confirmation selects the best promoted
-recipe if available, otherwise the best explored one, and trains seeds 0/1/2 from
-the same initialization. All three must pass validation. Select seed 0 of the best
+recipe if available, otherwise the best explored one. The selected parent must
+already pass every quality gate; otherwise stop before spending the confirmation
+budget. Confirmation trains seeds 0/1/2 from the same initialization. All three
+must pass validation. Select seed 0 of the best
 eligible recipe for final testing, rather than the highest-scoring seed.
 
 `finalize` evaluates that checkpoint on test at its saved validation confidence.

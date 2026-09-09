@@ -124,7 +124,11 @@ def main():
             },
         },
     )
-    if job["kind"] == "extract":
+    if job["kind"] == "diagnostic":
+        from .diagnostics import diagnostic_job
+
+        diagnostic_job(job)
+    elif job["kind"] == "extract":
         from .acquisition import extract_source
 
         extract_source(job)

@@ -82,7 +82,16 @@ def rank(record):
             metrics["checkpoint_bytes"],
             record["id"],
         )
-    return (1, -metrics["progress"], -metrics["ball"]["ap50_95"], record["id"])
+    # Zero ball AP makes the worst-gate score zero for many early candidates.
+    # Preserve improvements in the other class instead of breaking that tie by age.
+    return (
+        1,
+        -metrics["progress"],
+        -metrics["ball"]["ap50_95"],
+        -metrics["macro"]["ap50_95"],
+        -metrics["macro"]["f1"],
+        record["id"],
+    )
 
 
 def write_results(directory, records):
@@ -152,6 +161,14 @@ def load_state(cfg):
 def persist(cfg, state):
     save_json(cfg.output_dir / "state.json", state)
     write_results(cfg.output_dir, state["trials"])
+
+
+def remaining_seconds(cfg, state):
+    diagnostics = read_json(cfg.output_dir / "diagnostics/state.json", [])
+    spent = sum(
+        r["reserved_seconds"] if r["status"] == "running" else r["seconds"] for r in diagnostics
+    )
+    return cfg.budget.max_hours * 3600 - sum(r["seconds"] for r in state["trials"]) - spent
 
 
 def run_trial(cfg, state, recipe, phase, seed, timeout, executor=run_process):
@@ -247,6 +264,7 @@ def run_campaign(
     agent=None,
     retry_interrupted=False,
     phase_trial_limit=None,
+    recipes_override=None,
 ):
     initialize(cfg)
     if (cfg.output_dir / "final_test.json").exists():
@@ -269,7 +287,10 @@ def run_campaign(
     persist(cfg, state)
     agent = agent or ResearchAgent(cfg)
     if phase == "explore":
-        queue = [(recipe, 0) for recipe in cfg.recipes]
+        queue = [
+            (recipe, 0)
+            for recipe in (cfg.recipes if recipes_override is None else recipes_override)
+        ]
         previous_exploration = [
             r for r in state["trials"] if r["phase"] == "explore" and r["status"] == "completed"
         ]
@@ -299,6 +320,13 @@ def run_campaign(
         ]
         if not parents:
             raise ValueError(f"No completed {parent_phase} candidate to promote.")
+        if phase == "confirm":
+            parents = [r for r in parents if r["metrics"]["feasible"]]
+            if not parents:
+                raise ConfirmationIncomplete(
+                    f"Confirmation requires a {parent_phase} candidate passing every quality gate. "
+                    "No eligible candidate; the final test remains unopened."
+                )
         recipe = Recipe.model_validate(min(parents, key=rank)["recipe"])
         if phase == "confirm":
             recipe.epochs = cfg.budget.confirmation_epochs
@@ -329,11 +357,11 @@ def run_campaign(
             >= cfg.budget.max_exploration_trials
         ):
             break
-        remaining = cfg.budget.max_hours * 3600 - sum(r["seconds"] for r in state["trials"])
+        remaining = remaining_seconds(cfg, state)
         if remaining < minutes * 60:
             break
         if not queue:
-            if phase != "explore" or cfg.proposals != "codex":
+            if recipes_override is not None or phase != "explore" or cfg.proposals != "codex":
                 break
             proposal_index += 1
             proposal_dir = cfg.output_dir / "proposals" / f"proposal-{proposal_index:04d}"
@@ -452,5 +480,6 @@ def status(cfg):
         "providers": read_json(cfg.output_dir / "providers.json"),
         "acquisition": read_json(cfg.output_dir / "acquisition.json"),
         "experiments": read_json(cfg.output_dir / "state.json"),
+        "diagnostics": read_json(cfg.output_dir / "diagnostics/state.json", []),
         "final_test": read_json(cfg.output_dir / "final_test.json"),
     }
