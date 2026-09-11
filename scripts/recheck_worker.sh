@@ -36,11 +36,17 @@ Give a tight box around every clearly visible player and the ball. Fix wrong, mi
 Be efficient: finish in a few analysis steps, do NOT iteratively crop dozens of regions. If you use Python/PIL, write any temporary files ONLY inside this workspace scratch dir: $scratch (never /tmp)."
 
 log="$LOG_DIR/$key.log"
-if perl -e 'alarm shift; exec @ARGV' "$CAP" \
-  opencode run --agent image-tagger --dir "$REPO" "$prompt" -f "$img" >"$log" 2>&1; then
+perl -e 'alarm shift; exec @ARGV' "$CAP" \
+  opencode run --agent image-tagger --dir "$REPO" "$prompt" -f "$img" >"$log" 2>&1
+rc=$?
+
+# Keep manifest hashes in sync even when a run times out after writing labels.
+python3 "$REPO/scripts/reconcile_manifest.py" "$DS" "labels/$split/$base.txt" >>"$log" 2>&1 || true
+
+if [ "$rc" -eq 0 ]; then
   : > "$DONE_DIR/$key.ok"
   nlines=$(wc -l < "$lbl" 2>/dev/null | tr -d ' ')
   echo "OK   $key (label_lines=${nlines:-NA})"
 else
-  echo "ERR  $key (exit=$?, see $log)"
+  echo "ERR  $key (exit=$rc, see $log)"
 fi

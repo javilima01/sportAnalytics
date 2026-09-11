@@ -65,5 +65,8 @@ case "$mode" in
     echo "usage: $0 [pilot [N] | full]"; exit 2;;
 esac
 
+# Final safety sweep: refresh any manifest hashes left stale by interrupted workers.
+python3 "$REPO/scripts/reconcile_manifest.py" "$DS" || true
+
 ok=$(ls "$DONE_DIR"/*.ok 2>/dev/null | wc -l | tr -d ' ')
 echo "DONE markers: $ok / $total"

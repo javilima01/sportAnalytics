@@ -91,7 +91,9 @@ are supported, including uppercase extensions.
 Re-check every train/val/test image in a dataset in parallel and correct its
 YOLO labels. The run is resumable: completed images are recorded under
 `<dataset>/.recheck/done` and skipped on rerun. Use `pilot [N]` instead of `full`
-to review a small stratified sample first.
+to review a small stratified sample first. Each worker refreshes the affected
+`manifest.jsonl` label hash (`scripts/reconcile_manifest.py`), so the dataset
+stays valid for `research` after partial or interrupted runs.
 
 ```bash
 cd /Users/jbilbao/Desktop/repositories/sportAnalytics
