@@ -32,16 +32,16 @@ class YOLOFineTuner:
         self.logger.info("Training completed: %s", directory)
         return results
 
-    def validate(self):
+    def validate(self, split="val"):
         metrics = self.model.val(
             data=self.cfg.data,
             imgsz=self.cfg.imgsz,
             device=self.cfg.device,
             batch=self.cfg.batch,
             workers=self.cfg.workers,
-            split="val",
+            split=split,
         )
-        self._log_metrics("val", metrics)
+        self._log_metrics(split, metrics)
         return metrics
 
     def _log_metrics(self, stage, results):

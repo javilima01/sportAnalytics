@@ -20,7 +20,9 @@ def parse_args(argv=None):
     parser = argparse.ArgumentParser(description="Image tagging, label checking, and YOLO training")
 
     subparsers = parser.add_subparsers(
-        dest="command", required=True, help="Command: train, generate, or visualize"
+        dest="command",
+        required=True,
+        help="Command: train, generate, visualize, validate, research",
     )
 
     # --- TRAIN ---
@@ -115,7 +117,54 @@ def parse_args(argv=None):
         type=str,
         help="Directory to save visualizations instead of displaying",
     )
+    vis_parser.add_argument(
+        "--model",
+        default=None,
+        type=str,
+        help="YOLO checkpoint; draw live predictions instead of stored labels",
+    )
+    vis_parser.add_argument(
+        "--conf", default=0.25, type=float, help="Minimum prediction confidence [0-1]"
+    )
+    vis_parser.add_argument("--imgsz", default=1280, type=int, help="Prediction image size")
+    vis_parser.add_argument(
+        "--device",
+        default=None,
+        help="Device ('cpu', 'mps', or CUDA index); auto-select by default",
+    )
     vis_parser.add_argument("--edit", action="store_true", help="Open interactive label editor")
+
+    # --- VALIDATE ---
+    val_parser = subparsers.add_parser(
+        "validate", help="Validate one or more YOLO models without training"
+    )
+    val_parser.add_argument(
+        "--model",
+        nargs="*",
+        default=[],
+        help="One or more checkpoint paths (e.g. best.pt); directories expand to *.pt",
+    )
+    val_parser.add_argument(
+        "--models-dir",
+        default=None,
+        type=str,
+        help="Directory scanned for *.pt checkpoints (non-recursive)",
+    )
+    val_parser.add_argument("--data", required=True, type=str, help="Path to dataset YAML")
+    val_parser.add_argument(
+        "--split",
+        default="val",
+        choices=["train", "val", "test"],
+        help="Dataset split to validate on",
+    )
+    val_parser.add_argument("--imgsz", default=1280, type=int, help="Validation image size")
+    val_parser.add_argument("--batch", default=6, type=int, help="Batch size")
+    val_parser.add_argument(
+        "--device",
+        default=None,
+        help="Device ('cpu', 'mps', or CUDA index); auto-select by default",
+    )
+    val_parser.add_argument("--workers", default=8, type=int, help="Number of dataloader workers")
 
     research = subparsers.add_parser(
         "research", help="Acquire agent-labeled data and run experiments"
@@ -134,7 +183,143 @@ def parse_args(argv=None):
             command.add_argument(
                 "--phase", choices=("explore", "promote", "confirm"), default="explore"
             )
-    return parser.parse_args(argv)
+    args = parser.parse_args(argv)
+    if args.command == "visualize" and args.edit and args.model:
+        parser.error("--edit cannot be combined with --model; predictions are not labels.")
+    return args
+
+
+def collect_model_paths(model_entries, models_dir):
+    """Expand --model entries and --models-dir into an ordered, de-duplicated file list."""
+    from pathlib import Path
+
+    paths = []
+    seen = set()
+
+    def add_file(path):
+        key = str(path.resolve()) if path.exists() else str(path)
+        if key not in seen:
+            seen.add(key)
+            paths.append(path)
+
+    for entry in model_entries or []:
+        path = Path(entry)
+        if path.is_dir():
+            for checkpoint in sorted(path.glob("*.pt")):
+                if checkpoint.is_file():
+                    add_file(checkpoint)
+        else:
+            add_file(path)
+    if models_dir:
+        directory = Path(models_dir)
+        if not directory.is_dir():
+            raise NotADirectoryError(f"Models directory not found: {models_dir}")
+        for checkpoint in sorted(directory.glob("*.pt")):
+            if checkpoint.is_file():
+                add_file(checkpoint)
+    if not paths:
+        raise ValueError("No models to validate: pass --model and/or --models-dir.")
+    missing = [str(path) for path in paths if not path.is_file()]
+    if missing:
+        raise FileNotFoundError(f"Model checkpoint(s) not found: {', '.join(missing)}")
+    return paths
+
+
+def metric_row(metrics):
+    """Normalize an Ultralytics metrics object into a flat {column: value} mapping."""
+    row = {}
+    for key, value in dict(getattr(metrics, "results_dict", {})).items():
+        column = key.removeprefix("metrics/").removesuffix("(B)")
+        try:
+            row[column] = float(value)
+        except (TypeError, ValueError):
+            continue
+    speed = getattr(metrics, "speed", None) or {}
+    try:
+        row["inference_ms"] = float(speed["inference"])
+    except (KeyError, TypeError, ValueError):
+        pass
+    return row
+
+
+def render_table(headers, rows):
+    """Render a table with a left-aligned first column and right-aligned values."""
+    widths = [len(header) for header in headers]
+    for row in rows:
+        for index, cell in enumerate(row):
+            widths[index] = max(widths[index], len(cell))
+
+    def line(cells):
+        return "  ".join(
+            cell.rjust(widths[index]) if index else cell.ljust(widths[index])
+            for index, cell in enumerate(cells)
+        )
+
+    divider = "  ".join("-" * width for width in widths)
+    return "\n".join([line(headers), divider, *(line(row) for row in rows)])
+
+
+PREFERRED_COLUMNS = ("precision", "recall", "mAP50", "mAP50-95", "fitness", "inference_ms")
+
+
+def format_results_table(summary, failures):
+    columns = [name for name in PREFERRED_COLUMNS if any(name in row for row in summary.values())]
+    columns += sorted({name for row in summary.values() for name in row} - set(columns))
+    models = list(summary)
+    best = {}
+    if len(models) > 1:
+        for column in columns:
+            values = [summary[model][column] for model in models if column in summary[model]]
+            best[column] = min(values) if column.endswith("_ms") else max(values)
+
+    def cell(model, column):
+        value = summary[model].get(column)
+        if value is None:
+            return "-"
+        text = f"{value:.1f}" if column.endswith("_ms") else f"{value:.4f}"
+        return text + ("*" if best.get(column) == value else "")
+
+    headers = ["model", *columns]
+    rows = [[model, *(cell(model, column) for column in columns)] for model in models]
+    lines = [render_table(headers, rows)] if summary else []
+    if best:
+        lines.append("* best in column")
+    if failures:
+        lines.append("")
+        lines.extend(f"FAILED {model}: {error}" for model, error in failures.items())
+    return "\n".join(lines) or "No models validated."
+
+
+def run_validate(args):
+    from src.models import TrainConfig
+    from src.trainer import YOLOFineTuner
+
+    logger = setup_logger("YOLOValidate")
+    model_paths = collect_model_paths(args.model, args.models_dir)
+    summary = {}
+    failures = {}
+    for model_path in model_paths:
+        cfg = TrainConfig(
+            data=args.data,
+            model=str(model_path),
+            imgsz=args.imgsz,
+            batch=args.batch,
+            device=args.device,
+            workers=args.workers,
+        )
+        trainer = YOLOFineTuner(cfg)
+        try:
+            logger.info("Validating %s on split '%s'...", model_path, args.split)
+            summary[str(model_path)] = metric_row(trainer.validate(split=args.split))
+        except Exception as exc:
+            failures[str(model_path)] = str(exc)
+            logger.error("Validation failed for %s: %s", model_path, exc)
+        finally:
+            trainer.close()
+    print(format_results_table(summary, failures), flush=True)
+    if failures:
+        raise SystemExit(1)
+    return summary
 
 
 def run_research(args):
@@ -238,7 +423,15 @@ def run_visualize(args):
 
     logger = setup_logger("Visualizer")
     vis = Visualizer(
-        dataset_dir=args.dataset, split=args.split, max_images=args.max_images, logger=logger
+        dataset_dir=args.dataset,
+        split=args.split,
+        max_images=args.max_images,
+        logger=logger,
+        model_path=args.model,
+        conf=args.conf,
+        imgsz=args.imgsz,
+        device=args.device,
+        window_name="YOLO Predictions" if args.model else "YOLO Label Editor",
     )
 
     if args.edit:
@@ -256,10 +449,12 @@ def main():
         run_generate(args)
     elif args.command == "visualize":
         run_visualize(args)
+    elif args.command == "validate":
+        run_validate(args)
     elif args.command == "research":
         run_research(args)
     else:
-        raise ValueError("Invalid command. Use 'train', 'generate', or 'visualize'.")
+        raise ValueError("Invalid command. Use 'train', 'generate', 'visualize', or 'validate'.")
 
 
 if __name__ == "__main__":

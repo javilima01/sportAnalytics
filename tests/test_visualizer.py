@@ -121,3 +121,37 @@ def test_roboflow_images_without_labels(tmp_path):
     viewer = Visualizer(tmp_path, split="valid")
     assert viewer.image_dir == images
     assert viewer.label_dir == tmp_path / "valid/labels"
+
+
+def test_prediction_preview_draws_model_boxes(dataset, tmp_path, monkeypatch):
+    boxes = Mock()
+    boxes.cls.tolist.return_value = [1]
+    boxes.conf.tolist.return_value = [0.9]
+    boxes.xyxy.tolist.return_value = [[10, 10, 50, 50]]
+    model = Mock(task="detect", names={0: "player", 1: "ball"})
+    model.predict.return_value = [Mock(boxes=boxes)]
+    monkeypatch.setattr("src.visualizer.YOLO", Mock(return_value=model))
+    viewer = Visualizer(dataset, max_images=20, model_path="model.pt", conf=0.4, imgsz=640)
+    output = tmp_path / "preview"
+    viewer.visualize(output)
+    assert len(list(output.iterdir())) == 2
+    assert model.predict.call_args.kwargs["conf"] == 0.4
+    assert model.predict.call_args.kwargs["imgsz"] == 640
+    assert model.predict.call_args.kwargs["verbose"] is False
+
+
+def test_prediction_preview_rejects_bad_options(dataset):
+    with pytest.raises(ValueError, match=r"\.pt"):
+        Visualizer(dataset, model_path="model.onnx")
+    with pytest.raises(ValueError, match="conf"):
+        Visualizer(dataset, model_path="model.pt", conf=2)
+    with pytest.raises(ValueError, match="imgsz"):
+        Visualizer(dataset, model_path="model.pt", imgsz=8)
+
+
+def test_prediction_preview_is_read_only(dataset, monkeypatch):
+    model = Mock(task="detect", names={0: "player"})
+    monkeypatch.setattr("src.visualizer.YOLO", Mock(return_value=model))
+    viewer = Visualizer(dataset, model_path="model.pt")
+    with pytest.raises(ValueError, match="read-only"):
+        viewer.edit()

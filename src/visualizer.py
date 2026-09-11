@@ -1,9 +1,11 @@
-"""Inspect and edit YOLO detection labels with OpenCV."""
+"""Inspect, edit, and predict YOLO detections with OpenCV."""
 
+import math
 import random
 from pathlib import Path
 
 import cv2
+from ultralytics import YOLO
 
 from .config import setup_logger
 from .dataset import IMAGE_SUFFIXES, class_names, read_labels, read_names, write_labels
@@ -18,6 +20,10 @@ class Visualizer:
         max_images=5,
         window_name="YOLO Label Editor",
         logger=None,
+        model_path=None,
+        conf=0.25,
+        imgsz=1280,
+        device=None,
     ):
         if max_images < 1:
             raise ValueError("max_images must be positive.")
@@ -27,6 +33,19 @@ class Visualizer:
         )
         self.max_images, self.window_name = max_images, window_name
         self.logger = logger or setup_logger("Visualizer")
+        self.model = None
+        if model_path is not None:
+            if Path(model_path).suffix.lower() != ".pt":
+                raise ValueError("Prediction preview requires a YOLO .pt checkpoint.")
+            if not math.isfinite(conf) or not 0 <= conf <= 1:
+                raise ValueError("conf must be between 0 and 1.")
+            if imgsz < 32:
+                raise ValueError("imgsz must be at least 32.")
+            self.model = YOLO(str(model_path))
+            if self.model.task != "detect":
+                raise ValueError("Prediction preview requires a detection model.")
+            self.prediction_names = class_names(self.model.names)
+        self.conf, self.imgsz, self.device = conf, imgsz, device
         for image_dir, label_dir in (
             (self.dataset_dir / split / "images", self.dataset_dir / split / "labels"),
             (self.dataset_dir / "images" / split, self.dataset_dir / "labels" / split),
@@ -106,6 +125,34 @@ class Visualizer:
                 self.selected_box = len(self.boxes) - 1
                 self.image_modified = True
 
+    def _predict(self, image):
+        result = self.model.predict(
+            image, imgsz=self.imgsz, conf=self.conf, device=self.device, verbose=False
+        )[0]
+        boxes = result.boxes
+        return [
+            (int(cls), float(score), tuple(coordinates))
+            for cls, score, coordinates in zip(
+                boxes.cls.tolist(), boxes.conf.tolist(), boxes.xyxy.tolist()
+            )
+        ]
+
+    def _draw_predictions(self, image, predictions):
+        drawn = image.copy()
+        for cls, confidence, coordinates in predictions:
+            x1, y1, x2, y2 = map(round, coordinates)
+            cv2.rectangle(drawn, (x1, y1), (x2, y2), (0, 255, 0), 2)
+            cv2.putText(
+                drawn,
+                f"{self.prediction_names[cls]} {confidence:.2f}",
+                (x1, max(20, y1 - 5)),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                0.7,
+                (0, 255, 0),
+                2,
+            )
+        return drawn
+
     def visualize(self, save_dir=None):
         if not self.image_paths:
             self.logger.warning("No images found in %s", self.image_dir)
@@ -123,11 +170,14 @@ class Visualizer:
                 if image is None:
                     self.logger.warning("Cannot read %s", path)
                     continue
-                label_path = self.label_dir / f"{path.stem}.txt"
-                if not label_path.exists():
-                    self.logger.warning("Missing labels for %s", path.name)
-                boxes = read_labels(label_path, image.shape, self.names)
-                preview = self._draw_boxes(image, boxes)
+                if self.model is not None:
+                    preview = self._draw_predictions(image, self._predict(image))
+                else:
+                    label_path = self.label_dir / f"{path.stem}.txt"
+                    if not label_path.exists():
+                        self.logger.warning("Missing labels for %s", path.name)
+                    boxes = read_labels(label_path, image.shape, self.names)
+                    preview = self._draw_boxes(image, boxes)
                 if output:
                     if not cv2.imwrite(str(output / path.name), preview):
                         raise OSError(f"Cannot save preview for {path}.")
@@ -148,6 +198,8 @@ class Visualizer:
 
     def edit(self):
         """Edit all images; save changes on navigation, Esc, and window close."""
+        if self.model is not None:
+            raise ValueError("Prediction previews are read-only; drop --model to edit labels.")
         if not self.image_paths:
             self.logger.warning("No images found in %s", self.image_dir)
             return
