@@ -11,6 +11,17 @@ class Settings(BaseModel):
     model_config = ConfigDict(extra="forbid", allow_inf_nan=False)
 
 
+ReasoningEffort = Literal["minimal", "low", "medium", "high", "xhigh", "max"]
+ProviderName = Literal["codex", "opencode"]
+
+
+def infer_provider(executable: str, override: ProviderName | None = None) -> ProviderName:
+    """An explicit provider wins; otherwise the executable name picks the CLI."""
+    if override is not None:
+        return override
+    return "opencode" if "opencode" in Path(executable).name.lower() else "codex"
+
+
 class Source(Settings):
     id: str = Field(pattern=r"^[a-zA-Z0-9_-]+$")
     url: str
@@ -118,13 +129,24 @@ class Budget(Settings):
 
 class Fallback(Settings):
     enabled: bool = True
+    # Optional override when the executable name does not reveal its provider.
+    provider: ProviderName | None = None
     executable: str = "opencode"
-    model: str = Field(
-        "opencode/muse-spark-1.3-contributor-free", pattern=r"^opencode/[a-zA-Z0-9._-]+-free$"
-    )
+    model: str | None = "opencode/muse-spark-1.3-contributor-free"
+    # Codex receives model_reasoning_effort; OpenCode receives a model variant.
+    reasoning_effort: ReasoningEffort | None = None
     codex_retry_seconds: float = Field(300, ge=30)
     opencode_retry_seconds: float = Field(60, ge=30)
     max_wait_hours: float = Field(24, gt=0, le=168)
+
+    @model_validator(mode="after")
+    def model_for_provider(self):
+        provider = infer_provider(self.executable, self.provider)
+        if provider == "opencode" and not self.model:
+            raise ValueError("An OpenCode fallback requires a fallback.model.")
+        if provider == "codex" and "model" not in self.model_fields_set:
+            self.model = None  # The OpenCode default must not reach the Codex CLI.
+        return self
 
 
 class DataGrowth(Settings):
@@ -182,9 +204,12 @@ class Campaign(Settings):
         "spectators and staff. Ball is the match football, including partially visible balls "
         "only when identifiable. Reject ambiguous frames rather than guessing."
     )
+    # Primary research agent. The provider is inferred from the executable name
+    # (codex or opencode) unless explicitly set here.
+    provider: ProviderName | None = None
     codex_executable: str = "codex"
     codex_model: str | None = "gpt-6-astra"
-    codex_reasoning_effort: Literal["low", "medium", "high", "xhigh", "max"] | None = "high"
+    codex_reasoning_effort: ReasoningEffort | None = "high"
     fallback: Fallback = Field(default_factory=Fallback)
     proposals: Literal["codex", "queue"] = "codex"
     acquisition: Acquisition = Field(default_factory=Acquisition)
@@ -217,6 +242,10 @@ class Campaign(Settings):
             raise ValueError("Class names must be unique.")
         if self.evaluation.ball_class_id >= len(self.names):
             raise ValueError("Ball class ID is outside the taxonomy.")
+        if infer_provider(self.codex_executable, self.provider) == "opencode" and (
+            not self.codex_model or "codex_model" not in self.model_fields_set
+        ):
+            raise ValueError("An OpenCode primary agent requires an explicit codex_model.")
         return self
 
 

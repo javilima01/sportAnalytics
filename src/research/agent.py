@@ -4,12 +4,12 @@ import json
 import os
 import time
 from pathlib import Path
-from typing import Literal
+from typing import ClassVar, Literal
 
 from pydantic import Field, model_validator
 
 from ..dataset import atomic_write
-from .config import Recipe, Settings, Source, base_models
+from .config import ProviderName, Recipe, Settings, Source, base_models, infer_provider
 from .providers import (
     ProvidersUnavailable,
     QuotaExceeded,
@@ -64,12 +64,52 @@ def strict_schema(model):
     return schema
 
 
+class AgentEndpoint:
+    """One configured CLI agent: provider, executable, model and reasoning effort."""
+
+    def __init__(self, provider, executable, model, reasoning_effort):
+        self.provider = provider
+        self.executable = executable
+        self.model = model
+        self.reasoning_effort = reasoning_effort
+
+
+def primary_endpoint(cfg):
+    return AgentEndpoint(
+        infer_provider(cfg.codex_executable, cfg.provider),
+        cfg.codex_executable,
+        cfg.codex_model,
+        cfg.codex_reasoning_effort,
+    )
+
+
+def fallback_endpoint(cfg):
+    return AgentEndpoint(
+        infer_provider(cfg.fallback.executable, cfg.fallback.provider),
+        cfg.fallback.executable,
+        cfg.fallback.model,
+        cfg.fallback.reasoning_effort,
+    )
+
+
+def endpoint_for(cfg, provider):
+    endpoint = primary_endpoint(cfg)
+    if endpoint.provider != provider and cfg.fallback.enabled:
+        endpoint = fallback_endpoint(cfg)
+    if endpoint.provider != provider:
+        raise ValueError(f"The campaign does not configure a {provider} agent.")
+    return endpoint
+
+
 class CodexAgent:
-    def __init__(self, cfg):
+    provider: ClassVar[ProviderName] = "codex"
+
+    def __init__(self, cfg, endpoint=None):
         self.cfg = cfg
+        self.endpoint = endpoint or endpoint_for(cfg, self.provider)
 
     def check_ready(self, directory):
-        executable = executable_path(self.cfg.codex_executable)
+        executable = executable_path(self.endpoint.executable)
         try:
             run_process(
                 [executable, "login", "status"], timeout=30, log=Path(directory) / "login.log"
@@ -82,7 +122,7 @@ class CodexAgent:
     def request(self, prompt, response_type, directory, *, images=(), timeout=None):
         directory = Path(directory).resolve()
         directory.mkdir(parents=True, exist_ok=True)
-        executable = executable_path(self.cfg.codex_executable)
+        executable = executable_path(self.endpoint.executable)
         schema = directory / "schema.json"
         response = directory / "response.json"
         save_json(schema, strict_schema(response_type))
@@ -104,10 +144,10 @@ class CodexAgent:
             "--output-last-message",
             str(response),
         ]
-        if self.cfg.codex_model:
-            command += ["--model", self.cfg.codex_model]
-        if self.cfg.codex_reasoning_effort:
-            command += ["--config", f'model_reasoning_effort="{self.cfg.codex_reasoning_effort}"']
+        if self.endpoint.model:
+            command += ["--model", self.endpoint.model]
+        if self.endpoint.reasoning_effort:
+            command += ["--config", f'model_reasoning_effort="{self.endpoint.reasoning_effort}"']
         for image in images:
             command += ["--image", str(Path(image).resolve())]
         command += ["-"]
@@ -172,15 +212,17 @@ class CodexAgent:
 
 
 class OpenCodeAgent(CodexAgent):
-    """The same annotation/proposal contracts through the configured free vision model."""
+    """The same annotation/proposal contracts through an OpenCode vision model."""
 
-    def __init__(self, cfg):
-        super().__init__(cfg)
+    provider: ClassVar[ProviderName] = "opencode"
+
+    def __init__(self, cfg, endpoint=None):
+        super().__init__(cfg, endpoint)
         self.executable = None
         self.metadata = None
 
     def environment(self):
-        model = self.cfg.fallback.model
+        model = self.endpoint.model
         return {
             "PATH": str(Path(self.executable).parent) + os.pathsep + os.environ.get("PATH", ""),
             "OPENCODE_CONFIG_CONTENT": json.dumps(
@@ -200,26 +242,26 @@ class OpenCodeAgent(CodexAgent):
 
     def check_ready(self, directory):
         self.metadata = None
-        self.executable = executable_path(self.cfg.fallback.executable)
-        log = Path(directory) / "models.log"
-        run_process(
-            [self.executable, "models", "opencode", "--verbose", "--pure"],
-            timeout=30,
-            log=log,
-            env=self.environment(),
+        self.executable = executable_path(self.endpoint.executable)
+        catalog_provider = (
+            self.endpoint.model.split("/", 1)[0] if "/" in self.endpoint.model else None
         )
-        metadata = model_metadata(log.read_text(), self.cfg.fallback.model)
+        command = [self.executable, "models"]
+        if catalog_provider:
+            command.append(catalog_provider)
+        command += ["--verbose", "--pure"]
+        log = Path(directory) / "models.log"
+        run_process(command, timeout=30, log=log, env=self.environment())
+        metadata = model_metadata(log.read_text(), self.endpoint.model)
         cost = metadata.get("cost", {})
-        if (
-            cost.get("input") != 0
-            or cost.get("output") != 0
-            or any(value != 0 for value in cost.get("cache", {}).values())
-        ):
-            raise ValueError(
-                "The fallback model is not listed as free; refusing a paid substitution."
+        if cost.get("input") or cost.get("output") or any(cost.get("cache", {}).values()):
+            print(
+                f"[agent] Warning: {self.endpoint.model} is not listed as free; "
+                "requests may be billed.",
+                flush=True,
             )
         if not metadata.get("capabilities", {}).get("input", {}).get("image"):
-            raise ValueError("The fallback model must accept images for annotation.")
+            raise ValueError("The OpenCode model must accept images for annotation.")
         save_json(Path(directory) / "model.json", metadata)
         self.metadata = metadata
 
@@ -245,10 +287,12 @@ class OpenCodeAgent(CodexAgent):
             "--format",
             "json",
             "--model",
-            self.cfg.fallback.model,
+            self.endpoint.model,
             "--dir",
             str(directory),
         ]
+        if self.endpoint.reasoning_effort:
+            command += ["--variant", self.endpoint.reasoning_effort]
         for image in images:
             command += ["--file", str(Path(image).resolve())]
         events = execute_events(
@@ -271,19 +315,36 @@ class OpenCodeAgent(CodexAgent):
         return value
 
 
-class ResearchAgent(CodexAgent):
-    """Prefer Codex, use OpenCode during quota cooldowns, and persist routing on resume."""
+def agent_class(provider):
+    return CodexAgent if provider == "codex" else OpenCodeAgent
+
+
+def route_key(endpoint):
+    """Cooldowns are per endpoint, so a same-provider fallback model is still attempted."""
+    return f"{endpoint.provider}:{endpoint.model or 'default'}"
+
+
+class ResearchAgent:
+    """Prefer the primary agent, use the fallback during quota cooldowns, persist routing."""
 
     def __init__(self, cfg):
-        super().__init__(cfg)
-        self.clients = {"codex": CodexAgent(cfg), "opencode": OpenCodeAgent(cfg)}
+        self.cfg = cfg
+        self.endpoints = [primary_endpoint(cfg)]
+        if cfg.fallback.enabled:
+            self.endpoints.append(fallback_endpoint(cfg))
+        self.routes = [
+            (endpoint.provider, agent_class(endpoint.provider)(cfg, endpoint))
+            for endpoint in self.endpoints
+        ]
         self.state_path = cfg.output_dir / "providers.json"
-        self.state = read_json(self.state_path, {"cooldowns": {}, "active": "codex", "events": []})
+        self.state = read_json(
+            self.state_path,
+            {"cooldowns": {}, "active": self.endpoints[0].provider, "events": []},
+        )
 
     def check_ready(self, directory):
-        self.clients["codex"].check_ready(Path(directory) / "codex")
-        if self.cfg.fallback.enabled:
-            self.clients["opencode"].check_ready(Path(directory) / "opencode")
+        for index, (provider, client) in enumerate(self.routes):
+            client.check_ready(Path(directory) / f"{index:02d}-{provider}")
 
     def request(self, prompt, response_type, directory, *, images=(), timeout=None):
         directory = Path(directory).resolve()
@@ -291,13 +352,16 @@ class ResearchAgent(CodexAgent):
         deadline = time.monotonic() + (
             self.cfg.acquisition.agent_timeout_seconds if timeout is None else timeout
         )
-        providers = ["codex", "opencode"] if self.cfg.fallback.enabled else ["codex"]
-        for provider in providers:
-            if self.state["cooldowns"].get(provider, 0) > time.time():
+        wait_until = None
+        for index, (provider, client) in enumerate(self.routes):
+            key = route_key(self.endpoints[index])
+            cooldown = self.state["cooldowns"].get(key, 0)
+            if cooldown > time.time():
+                wait_until = cooldown if wait_until is None else min(wait_until, cooldown)
                 continue
             attempt = directory / f"{provider}-{len(list(directory.glob(provider + '-*'))) + 1:03d}"
             try:
-                result = self.clients[provider].request(
+                result = client.request(
                     prompt,
                     response_type,
                     attempt,
@@ -316,13 +380,19 @@ class ResearchAgent(CodexAgent):
                     if error.retry_at
                     else time.time() + interval
                 )
-                self.state["cooldowns"][provider] = max(time.time() + 30, retry_at)
+                self.state["cooldowns"][key] = max(time.time() + 30, retry_at)
+                wait_until = (
+                    self.state["cooldowns"][key]
+                    if wait_until is None
+                    else min(wait_until, self.state["cooldowns"][key])
+                )
                 self.state["events"].append(
                     {
                         "time": time.time(),
                         "provider": provider,
+                        "key": key,
                         "event": "quota",
-                        "retry_at": self.state["cooldowns"][provider],
+                        "retry_at": self.state["cooldowns"][key],
                     }
                 )
                 save_json(self.state_path, self.state)
@@ -333,7 +403,7 @@ class ResearchAgent(CodexAgent):
                 continue
             previous = self.state["active"]
             self.state.update(active=provider)
-            self.state["cooldowns"].pop(provider, None)
+            self.state["cooldowns"].pop(key, None)
             if previous != provider:
                 self.state["events"].append(
                     {"time": time.time(), "provider": provider, "event": "selected"}
@@ -341,18 +411,15 @@ class ResearchAgent(CodexAgent):
                 print(f"[agent] Using {provider}.", flush=True)
             save_json(self.state_path, self.state)
             save_json(directory / "response.json", result.model_dump())
+            endpoint = self.endpoints[index]
             save_json(
                 directory / "provider.json",
                 {
                     "provider": provider,
-                    "model": self.cfg.fallback.model
-                    if provider == "opencode"
-                    else self.cfg.codex_model,
-                    "reasoning_effort": self.cfg.codex_reasoning_effort
-                    if provider == "codex"
-                    else None,
+                    "model": endpoint.model,
+                    "reasoning_effort": endpoint.reasoning_effort,
                     "record": str(attempt),
                 },
             )
             return result
-        raise ProvidersUnavailable(min(self.state["cooldowns"][provider] for provider in providers))
+        raise ProvidersUnavailable(wait_until if wait_until is not None else time.time() + 30)

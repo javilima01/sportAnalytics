@@ -143,39 +143,47 @@ can finish training sooner.
 
 ### Automatic provider fallback
 
-The configured primary agent is `codex_model: gpt-6-astra` with
-`codex_reasoning_effort: high`. Use `medium` before the first campaign launch if
-preferred. The runner passes both explicitly to `codex exec`; it ignores the CLI's
-user configuration and does not inherit this chat's model/reasoning selection.
-Successful request provenance records both settings. These configure the research
-and annotation agent; the YOLO teacher and trained student are separate models.
+Either Codex or OpenCode can be the primary agent or the fallback. The provider is
+inferred from the executable name (`codex` or `opencode`); set `provider:` at the
+top level or under `fallback` to override that inference. The primary agent uses
+`codex_executable`, `codex_model` and `codex_reasoning_effort`; the fallback uses
+`fallback.executable`, `fallback.model` and `fallback.reasoning_effort`. Codex
+receives `model_reasoning_effort` and OpenCode a model variant. The runner passes
+these explicitly; it ignores the CLI's user configuration and does not inherit this
+chat's model/reasoning selection. Successful request provenance records both
+settings. These configure the research and annotation agent; the YOLO teacher and
+trained student are separate models.
 
-Codex is preferred. If its CLI reports a usage/quota limit, the pending request is
-sent to **`opencode/muse-spark-1.3-contributor-free`** through OpenCode. The model ID
-matches the [OpenCode Zen catalog](https://opencode.ai/docs/zen/); the local catalog
-and a live image-annotation smoke test confirmed image input support. Executables
-added by interactive terminal startup (such as nvm installations) are discovered
-automatically, so the IDE's older PATH does not need to be edited.
+The primary agent is preferred. If its CLI reports a usage/quota limit, the pending
+request is sent to the fallback. The default fallback is
+**`opencode/muse-spark-1.3-contributor-free`**; the model ID matches the
+[OpenCode Zen catalog](https://opencode.ai/docs/zen/), and a live image-annotation
+smoke test confirmed image input support. Executables added by interactive terminal
+startup (such as nvm installations) are discovered automatically, so the IDE's older
+PATH does not need to be edited.
 On macOS, if `codex` is absent from both PATHs, the controller also discovers the
 newest executable Codex bundle for the native architecture in VS Code, VS Code
 Insiders or Cursor's standard extension directory. This lets `research init` work
 when the extension is installed but the bare `codex` terminal command is unavailable.
 Explicit executable paths and installed CLI commands take precedence.
 
-`fallback.codex_retry_seconds` defaults to 300: at a subsequent request boundary
-after that cooldown, try Codex first and switch back on success. An earlier reset
-timestamp from a structured quota error can shorten the cooldown. This is periodic
-recovery, not an instantaneous background switch. `fallback.opencode_retry_seconds`
-defaults to 60. Authentication failures, malformed output and ordinary network
-errors remain visible; they do not masquerade as quota exhaustion.
+`fallback.codex_retry_seconds` defaults to 300 and `fallback.opencode_retry_seconds`
+to 60. A cooldown is tracked per endpoint (`provider:model`), so a same-provider
+fallback model is still attempted while the primary model is limited. At a subsequent
+request boundary after that cooldown, the primary is tried first and takes over on
+success. An earlier reset timestamp from a structured quota error can shorten the
+cooldown. This is periodic recovery, not an instantaneous background switch.
+Authentication failures, malformed output and ordinary network errors remain
+visible; they do not masquerade as quota exhaustion.
 
-Only the configured free OpenCode model is selected, including auxiliary requests.
-Startup checks its catalog pricing and image capability. No paid model is substituted.
-Free availability can change; the catalog check is not a guarantee of future service
-availability. The Contributor Free service may use submitted prompts and completions
-for model improvement; see the provider's [privacy notes](https://opencode.ai/docs/zen/#privacy).
+Startup checks every OpenCode model's catalog entry for image support, including
+auxiliary requests, and warns when its listed cost is non-zero. The configured model
+is used exactly; no model is substituted. Catalog pricing can change, so the warning
+is not a guarantee of future cost. The Contributor Free service may use submitted
+prompts and completions for model improvement; see the provider's
+[privacy notes](https://opencode.ai/docs/zen/#privacy).
 
-If both providers hit limits, `init`/`auto` persist progress and wait, then retry.
+If all configured providers hit limits, `init`/`auto` persist progress and wait, then retry.
 Accepted images and completed training trials remain intact, and quota events do
 not consume an image's annotation retries. Waiting is separately capped by
 `fallback.max_wait_hours` (24 hours cumulative by default), with each sleep reserved
@@ -188,7 +196,8 @@ persist. Individual debugging commands surface quota unavailability rather than 
 has a `provider.json` identifying its provider/model and raw attempt directory.
 These records also survive restarting the controller. Prompts and label validation
 use the same taxonomy/schema across both providers. Record mixed provider provenance
-when interpreting label quality. Set `fallback.enabled: false` for Codex-only use.
+when interpreting label quality. Set `fallback.enabled: false` to use the primary
+agent only.
 
 ## Hardware and budgets
 

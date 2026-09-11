@@ -11,7 +11,7 @@ from pathlib import Path
 
 from ..dataset import atomic_write
 from .agent import ResearchAgent
-from .config import Recipe
+from .config import Campaign, Recipe
 from .evaluation import acceptance
 from .manifest import audit_dataset
 from .providers import ProvidersUnavailable
@@ -24,12 +24,31 @@ class ConfirmationIncomplete(ValueError):
     """The recipe has not passed all required confirmation seeds."""
 
 
+def contract_form(value):
+    """Explicit non-default settings only, so newly added defaulted fields keep old contracts."""
+    return Campaign.model_validate(value).model_dump(mode="json", exclude_defaults=True)
+
+
 def initialize(cfg):
     cfg.output_dir.mkdir(parents=True, exist_ok=True)
     path = cfg.output_dir / "contract.json"
     value = cfg.model_dump(mode="json")
-    if path.exists() and read_json(path) != value:
-        raise ValueError("Campaign configuration changed. Use a new output directory/campaign ID.")
+    stored = read_json(path)
+    if stored is not None and stored != value:
+        if contract_form(stored) != contract_form(value):
+            raise ValueError(
+                "Campaign configuration changed. Use a new output directory/campaign ID."
+            )
+        # A newer schema only added defaulted settings. Migrate the frozen contract and
+        # its budget-change hashes instead of invalidating resumable campaigns.
+        changes = cfg.output_dir / "budget_changes.json"
+        records = read_json(changes, [])
+        previous = value_hash(stored)
+        for record in records:
+            if record["contract_hash"] == previous:
+                record["contract_hash"] = value_hash(value)
+        if records:
+            save_json(changes, records)
     save_json(path, value)
 
 

@@ -6,6 +6,7 @@ from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
+from pydantic import ValidationError
 
 from src.research.agent import CodexAgent, OpenCodeAgent, ResearchAgent, Review
 from src.research.config import Campaign
@@ -48,7 +49,7 @@ def test_fallback_persists_and_returns_to_codex(cfg, tmp_path, monkeypatch):
     router = ResearchAgent(cfg)
     codex = Client([QuotaExceeded("codex")])
     muse = Client([accepted()])
-    router.clients = {"codex": codex, "opencode": muse}
+    router.routes = [("codex", codex), ("opencode", muse)]
     image = tmp_path / "image.jpg"
     result = router.request("inspect", Review, tmp_path / "first", images=[image], timeout=10)
     assert result.status == "accepted"
@@ -61,7 +62,7 @@ def test_fallback_persists_and_returns_to_codex(cfg, tmp_path, monkeypatch):
     router = ResearchAgent(cfg)
     codex = Client([accepted()])
     muse = Client([accepted()])
-    router.clients = {"codex": codex, "opencode": muse}
+    router.routes = [("codex", codex), ("opencode", muse)]
     router.request("again", Review, tmp_path / "second")
     assert not codex.calls and len(muse.calls) == 1
     now[0] += cfg.fallback.codex_retry_seconds + 1
@@ -106,7 +107,7 @@ def test_codex_passes_explicit_model_and_reasoning(cfg, tmp_path, monkeypatch, e
 def test_ordinary_errors_do_not_switch_providers(cfg, tmp_path, error):
     router = ResearchAgent(cfg)
     muse = Client([])
-    router.clients = {"codex": Client([error]), "opencode": muse}
+    router.routes = [("codex", Client([error])), ("opencode", muse)]
     with pytest.raises(type(error), match=str(error)):
         router.request("request", Review, tmp_path / "request")
     assert not muse.calls
@@ -115,21 +116,23 @@ def test_ordinary_errors_do_not_switch_providers(cfg, tmp_path, error):
 def test_both_limited_raise_resumable_wait(cfg, tmp_path, monkeypatch):
     monkeypatch.setattr("src.research.agent.time.time", lambda: 1000)
     router = ResearchAgent(cfg)
-    router.clients = {p: Client([QuotaExceeded(p)]) for p in ("codex", "opencode")}
+    router.routes = [(p, Client([QuotaExceeded(p)])) for p in ("codex", "opencode")]
     with pytest.raises(ProvidersUnavailable) as result:
         router.request("request", Review, tmp_path / "request")
     assert result.value.retry_at == 1060
-    assert router.state["cooldowns"] == {"codex": 1300, "opencode": 1060}
+    assert router.state["cooldowns"] == {
+        "codex:gpt-6-astra": 1300,
+        "opencode:opencode/muse-spark-1.3-contributor-free": 1060,
+    }
 
 
 def test_disabled_fallback_waits_for_codex(cfg, tmp_path):
     cfg.fallback.enabled = False
     router = ResearchAgent(cfg)
-    muse = Client([])
-    router.clients = {"codex": Client([QuotaExceeded("codex")]), "opencode": muse}
+    assert [provider for provider, _ in router.routes] == ["codex"]
+    router.routes = [("codex", Client([QuotaExceeded("codex")]))]
     with pytest.raises(ProvidersUnavailable):
         router.request("request", Review, tmp_path / "request")
-    assert not muse.calls
 
 
 @pytest.mark.parametrize(
@@ -232,8 +235,8 @@ def test_explicit_cli_on_path_takes_precedence(monkeypatch):
     assert executable_path("codex") == "/opt/bin/codex"
 
 
-@pytest.mark.parametrize("cost,vision", [(1, True), (0, False)])
-def test_opencode_rejects_paid_or_nonvision_model(cfg, tmp_path, monkeypatch, cost, vision):
+@pytest.mark.parametrize("cost,vision", [(0, True), (1, True), (0, False), (1, False)])
+def test_opencode_checks_model_cost_and_vision(cfg, tmp_path, monkeypatch, capsys, cost, vision):
     monkeypatch.setattr("src.research.agent.executable_path", lambda name: "/bin/opencode")
     metadata = {
         "providerID": "opencode",
@@ -243,23 +246,31 @@ def test_opencode_rejects_paid_or_nonvision_model(cfg, tmp_path, monkeypatch, co
     }
 
     def execute(command, log, **kwargs):
+        assert command[1:3] == ["models", "opencode"]
         Path(log).parent.mkdir(parents=True, exist_ok=True)
         Path(log).write_text(cfg.fallback.model + "\n" + json.dumps(metadata, indent=2))
 
     monkeypatch.setattr("src.research.agent.run_process", execute)
     client = OpenCodeAgent(cfg)
-    with pytest.raises(ValueError, match="free|images"):
-        client.check_ready(tmp_path)
-    assert client.metadata is None  # Failed validation must not authorize a later request.
+    if not vision:
+        with pytest.raises(ValueError, match="images"):
+            client.check_ready(tmp_path)
+        assert client.metadata is None  # Failed validation must not authorize a later request.
+        return
+    client.check_ready(tmp_path)
+    assert client.metadata == metadata
+    assert ("not listed as free" in capsys.readouterr().out) == bool(cost)
 
 
 def test_opencode_parses_json_and_uses_only_selected_model(cfg, tmp_path, monkeypatch):
+    cfg.fallback.reasoning_effort = "medium"
     client = OpenCodeAgent(cfg)
     client.executable = "/bin/opencode"
     client.metadata = {"ready": True}
 
     def execute(command, **kwargs):
         assert command[command.index("--model") + 1] == cfg.fallback.model
+        assert command[command.index("--variant") + 1] == "medium"
         assert "--pure" in command
         environment = json.loads(kwargs["env"]["OPENCODE_CONFIG_CONTENT"])
         assert environment["small_model"] == cfg.fallback.model
@@ -279,3 +290,70 @@ def test_catalog_lookup_uses_exact_free_model(cfg):
     free = {"providerID": "opencode", "id": "muse-spark-1.3-contributor-free"}
     catalog = "paid\n" + json.dumps(paid, indent=2) + "\nfree\n" + json.dumps(free, indent=2)
     assert model_metadata(catalog, cfg.fallback.model) == free
+
+
+def test_providers_swap_between_primary_and_fallback(tmp_path, monkeypatch):
+    monkeypatch.setattr("src.research.agent.time.time", lambda: 1000.0)
+    cfg = Campaign(
+        output_dir=tmp_path / "campaign",
+        codex_executable="opencode",
+        codex_model="opencode-go/deepseek-v4.1-flash",
+        codex_reasoning_effort="high",
+        fallback={
+            "executable": "codex",
+            "model": "gpt-6-astra",
+            "reasoning_effort": "medium",
+        },
+    )
+    router = ResearchAgent(cfg)
+    assert [provider for provider, _ in router.routes] == ["opencode", "codex"]
+    primary = Client([QuotaExceeded("opencode")])
+    backup = Client([accepted()])
+    router.routes = [("opencode", primary), ("codex", backup)]
+    result = router.request("inspect", Review, tmp_path / "swap")
+    assert result.status == "accepted"
+    assert len(primary.calls) == 1 and len(backup.calls) == 1
+    record = read_json(tmp_path / "swap/provider.json")
+    assert record["provider"] == "codex"
+    assert record["model"] == "gpt-6-astra"
+    assert record["reasoning_effort"] == "medium"
+    assert read_json(cfg.output_dir / "providers.json")["active"] == "codex"
+
+
+def test_same_provider_fallback_model_is_attempted(tmp_path, monkeypatch):
+    monkeypatch.setattr("src.research.agent.time.time", lambda: 1000.0)
+    cfg = Campaign(
+        output_dir=tmp_path / "campaign",
+        codex_executable="opencode",
+        codex_model="opencode-go/deepseek-v4.1-flash",
+        fallback={"executable": "opencode", "model": "opencode/muse-spark-1.3-contributor-free"},
+    )
+    router = ResearchAgent(cfg)
+    primary = Client([QuotaExceeded("opencode")])
+    free = Client([accepted()])
+    router.routes = [("opencode", primary), ("opencode", free)]
+    assert router.request("inspect", Review, tmp_path / "same").status == "accepted"
+    assert len(primary.calls) == 1 and len(free.calls) == 1
+
+
+def test_explicit_provider_overrides_executable_name(tmp_path):
+    cfg = Campaign(
+        output_dir=tmp_path / "campaign",
+        provider="opencode",
+        codex_executable="codex",
+        codex_model="opencode-go/deepseek-v4.1-flash",
+    )
+    assert [endpoint.provider for endpoint in ResearchAgent(cfg).endpoints] == [
+        "opencode",
+        "opencode",
+    ]
+
+
+def test_opencode_primary_requires_explicit_model(tmp_path):
+    with pytest.raises(ValidationError, match="codex_model"):
+        Campaign(output_dir=tmp_path / "campaign", codex_executable="opencode")
+
+
+def test_fallback_codex_drops_the_opencode_default_model(tmp_path):
+    cfg = Campaign(output_dir=tmp_path / "campaign", fallback={"executable": "codex"})
+    assert cfg.fallback.model is None

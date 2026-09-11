@@ -99,7 +99,7 @@ def run_autonomous(
             record("finalize", f"Final test: {result['status']}.", "completed")
             return workflow
 
-        record("preflight", "Checking Codex CLI login before acquisition or training.")
+        record("preflight", "Checking the configured agent CLIs before acquisition or training.")
         agent = agent or ResearchAgent(cfg)
         agent.check_ready(cfg.output_dir / "preflight")
 

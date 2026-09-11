@@ -86,6 +86,18 @@ saves an empty label file to mark an image as background. Malformed labels raise
 an error instead of being silently dropped. JPG/JPEG, PNG, BMP, and WebP images
 are supported, including uppercase extensions.
 
+## Recheck all labels
+
+Re-check every train/val/test image in a dataset in parallel and correct its
+YOLO labels. The run is resumable: completed images are recorded under
+`<dataset>/.recheck/done` and skipped on rerun. Use `pilot [N]` instead of `full`
+to review a small stratified sample first.
+
+```bash
+cd /Users/jbilbao/Desktop/repositories/sportAnalytics
+PARALLEL=3 nohup bash scripts/recheck_astra_high.sh full >> datasets/football-astra-high/.recheck/full_run.log 2>&1 &
+```
+
 ## Train on reviewed labels
 
 ```bash
@@ -143,16 +155,22 @@ resume after interruption; use `python main.py research status` from another
 terminal to see progress. To create a configuration without starting work, use
 `python main.py research init --config custom.yaml --config-only`.
 
-Startup checks the current Codex login before downloading, using the
-[documented authentication status command](https://learn.chatgpt.com/docs/auth).
+Startup checks the primary CLI login before downloading: Codex uses its
+[documented authentication status command](https://learn.chatgpt.com/docs/auth),
+and OpenCode validates its model catalog instead.
 
-If Codex reaches its usage limit, requests automatically switch to OpenCode using
-`opencode/muse-spark-1.3-contributor-free`. Codex is retried at request boundaries
-after a five-minute cooldown. Both providers use the same image-label and experiment
-schemas. The controller finds OpenCode through your interactive terminal PATH,
-checks that the configured fallback is listed as free and supports images, and
-records provider changes. If both hit limits, it saves progress and waits within
-the separate `fallback.max_wait_hours` allowance. No paid fallback is selected.
+Either provider can be the primary agent or the fallback: the provider is inferred
+from the executable name (`codex` or `opencode`), and an explicit `provider:` key
+overrides that inference. Each slot has its own model and reasoning setting
+(`codex_reasoning_effort` for the primary, `fallback.reasoning_effort` for the
+fallback); Codex receives `model_reasoning_effort` and OpenCode a model variant.
+If the primary reaches its usage limit, requests automatically switch to the
+fallback, which is retried at request boundaries after its cooldown. Both providers
+use the same image-label and experiment schemas. The controller finds executables
+through your interactive terminal PATH, checks OpenCode models for image support
+(warning when the catalog lists a non-zero cost), and records provider changes.
+If all configured providers hit limits, it saves progress and waits within the
+separate `fallback.max_wait_hours` allowance.
 
 See [EXPERIMENT.md](EXPERIMENT.md) for configuration, quality gates and limitations,
 and [program.md](program.md) for agent instructions. Scores measure agreement with

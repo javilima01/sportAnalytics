@@ -18,7 +18,14 @@ from src.research.config import Campaign, Evaluation, Recipe, Source, load_campa
 from src.research.controller import finalize, initialize, run_campaign, run_trial
 from src.research.evaluation import acceptance, match_detections, summarize
 from src.research.manifest import audit_dataset
-from src.research.runtime import campaign_lock, file_hash, read_json, run_process, save_json
+from src.research.runtime import (
+    campaign_lock,
+    file_hash,
+    read_json,
+    run_process,
+    save_json,
+    value_hash,
+)
 
 
 @pytest.fixture
@@ -66,6 +73,38 @@ def campaign(tmp_path):
     )
     atomic_write(cfg.dataset_dir / "manifest.jsonl", "".join(json.dumps(r) + "\n" for r in records))
     return cfg
+
+
+def test_initialize_migrates_contracts_with_new_defaulted_fields(tmp_path):
+    cfg = Campaign(output_dir=tmp_path / "runs", dataset_dir=tmp_path / "dataset")
+    initialize(cfg)
+    contract = read_json(cfg.output_dir / "contract.json")
+    # Simulate a campaign frozen before the agent provider fields existed.
+    contract.pop("provider")
+    contract["fallback"].pop("reasoning_effort")
+    save_json(cfg.output_dir / "contract.json", contract)
+    save_json(
+        cfg.output_dir / "budget_changes.json",
+        [{"decision_id": "d", "reason": "r", "contract_hash": value_hash(contract)}],
+    )
+    initialize(cfg)
+    current = cfg.model_dump(mode="json")
+    assert read_json(cfg.output_dir / "contract.json") == current
+    assert read_json(cfg.output_dir / "budget_changes.json")[0]["contract_hash"] == value_hash(
+        current
+    )
+
+
+def test_initialize_rejects_a_changed_setting(tmp_path):
+    cfg = Campaign(output_dir=tmp_path / "runs", dataset_dir=tmp_path / "dataset")
+    initialize(cfg)
+    changed = Campaign(
+        output_dir=tmp_path / "runs",
+        dataset_dir=tmp_path / "dataset",
+        budget={"max_trials": cfg.budget.max_trials + 1},
+    )
+    with pytest.raises(ValueError, match="configuration changed"):
+        initialize(changed)
 
 
 def good_metrics(checkpoint):

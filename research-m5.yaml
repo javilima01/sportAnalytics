@@ -6,11 +6,11 @@
 # Relative paths below resolve from the directory containing this file.
 
 # Name identifying this research campaign.
-campaign_id: football-m5-autonomous
+campaign_id: football-deepseek
 # Stores campaign state, trials, checkpoints, logs, and dataset-version records.
-output_dir: experiments/football-m5-autonomous
+output_dir: experiments/football-deepseek
 # Use the previous run as evidence and permit warm starts; old scores are not new acceptance evidence.
-prior_campaign: experiments/football-m5
+prior_campaign: football-m5-autonomous
 # Images, labels, manifest, and data.yaml used by this campaign.
 # This directory was already seeded with existing labels; changing its name does
 # not automatically copy a dataset. Repeated runs reuse the configured directory.
@@ -20,22 +20,26 @@ device: mps
 # Number of data-loader subprocesses; this is not the number of research agents.
 # M5 Pro 18 cores / 64GB: 8 feeds 1280px training without oversubscribing MPS.
 workers: 8
+# Primary research agent. The provider (codex or opencode) is inferred from the
+# executable name; set an explicit `provider:` only to override that inference.
 # CLI command (or full executable path) used to launch the primary research agent.
-codex_executable: codex
-# Model explicitly passed to the Codex CLI for research/annotation requests.
-codex_model: gpt-6-astra
-# Reasoning setting passed to Codex; medium is an alternative for lighter reasoning.
+codex_executable: opencode
+# Model passed to the primary CLI for research/annotation requests.
+codex_model: opencode-go/deepseek-v4.1-flash
+# Reasoning setting; Codex receives model_reasoning_effort, OpenCode a model variant.
 # This controls the agent, not the YOLO student's training compute.
 codex_reasoning_effort: high
 
 # Provider switching when an agent request hits an explicit usage/quota limit.
 fallback:
-  # Permit switching from Codex to OpenCode; unrelated errors do not trigger fallback.
+  # Permit switching away from the primary agent; unrelated errors do not trigger fallback.
   enabled: true
-  # OpenCode CLI command, also accepting a full executable path.
+  # Fallback CLI command (codex or opencode, inferred from its name), or a full path.
   executable: opencode
-  # Exact fallback model identifier; the runner checks its free/image capabilities.
+  # Exact fallback model identifier; OpenCode models are checked for image support.
   model: opencode/muse-spark-1.3-contributor-free
+  # Fallback reasoning level, independent of the primary agent's setting.
+  reasoning_effort: high
   # Retry Codex after its quota cooldown, normally 5 minutes, at a request boundary.
   # A reported earlier reset can shorten the cooldown; requests aren't interrupted.
   codex_retry_seconds: 300
@@ -45,7 +49,7 @@ fallback:
   max_wait_hours: 24
 # With diagnostics enabled, the agent chooses each next action/recipe from the start.
 # 'queue' would restrict experiment proposals to the configured recipes.
-# The provider router still decides whether a request uses Codex or OpenCode.
+# The provider router still decides whether a request uses the primary or fallback agent.
 proposals: codex
 # YOLO class order: class 0 = player, class 1 = ball. Preserve existing label IDs.
 names: [player, ball]
