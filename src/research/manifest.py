@@ -1,6 +1,7 @@
 """Freeze image/label provenance and reject contaminated evaluation splits."""
 
 import json
+import re
 from pathlib import Path
 
 import cv2
@@ -11,6 +12,10 @@ from .runtime import file_hash, value_hash
 
 class InsufficientCoverage(ValueError):
     """More accepted source images are needed before this dataset can be frozen."""
+
+
+def match_key(value):
+    return re.sub(r"[^a-z0-9]", "", value.casefold())
 
 
 def audit_dataset(directory, evaluation, splits=("train", "val", "test")):
@@ -27,7 +32,7 @@ def audit_dataset(directory, evaluation, splits=("train", "val", "test")):
         raise ValueError("Required ball class is absent.")
     manifest = root / "manifest.jsonl"
     records = [json.loads(line) for line in manifest.read_text().splitlines() if line.strip()]
-    groups, hashes, paths = {}, {}, set()
+    groups, hashes, paths, source_splits = {}, {}, set(), {}
     counts = {
         split: {"images": 0, "matches": set(), "instances": [0] * len(names)} for split in splits
     }
@@ -35,10 +40,15 @@ def audit_dataset(directory, evaluation, splits=("train", "val", "test")):
         split = record["split"]
         if split not in ("train", "val", "test"):
             raise ValueError("Unknown manifest split.")
-        group = record["match_id"]
+        group = match_key(record["match_id"])
         if group in groups and groups[group] != split:
             raise ValueError(f"Match leakage: {group}")
         groups[group] = split
+        source = record.get("source_url")
+        if source:
+            if source in source_splits and source_splits[source] != split:
+                raise ValueError("Source video leakage across splits.")
+            source_splits[source] = split
         if record["image_sha256"] in hashes and hashes[record["image_sha256"]] != split:
             raise ValueError("Duplicate image appears across splits.")
         hashes[record["image_sha256"]] = split
@@ -92,6 +102,7 @@ def audit_dataset(directory, evaluation, splits=("train", "val", "test")):
             {"manifest": file_hash(manifest), "yaml": file_hash(root / "data.yaml")}
         ),
         "counts": counts,
+        "benchmark_version": value_hash([r for r in records if r["split"] != "train"]),
         "label_provenance": "agent_labeled",
         "independent_ground_truth": False,
     }

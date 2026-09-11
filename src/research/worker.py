@@ -12,9 +12,14 @@ from pathlib import Path
 from ultralytics import YOLO
 
 from .config import Campaign, Recipe
-from .evaluation import evaluate
+from .evaluation import evaluate, localization_report
 from .progress import TrainingProgress
 from .runtime import file_hash, read_json, save_json
+
+
+def schedule_fraction(epoch, epochs, elapsed, seconds):
+    """Reach the final LR by the epoch cap or 90% of the wall-time allowance."""
+    return min(1.0, max(epoch / max(1, epochs - 1), elapsed / (seconds * 0.9)))
 
 
 def train_job(job):
@@ -24,18 +29,32 @@ def train_job(job):
     model = YOLO(recipe.model)
     start = time.monotonic()
     training_seconds = job["training_seconds"]
-    progress = TrainingProgress(folder, training_seconds)
+    progress = TrainingProgress(folder, training_seconds, cfg.evaluation.ball_class_id)
     progress.write(
         f"starting {recipe.id} ({recipe.model}), device={cfg.device}, "
         f"imgsz={recipe.imgsz}, seed={job['seed']}, "
         f"up to {recipe.epochs} epochs / {training_seconds / 60:.1f} min training"
     )
     progress.attach(model)
+    timed_out = False
+
+    def adapt_schedule(trainer):
+        def factor(epoch):
+            fraction = schedule_fraction(
+                epoch, recipe.epochs, time.monotonic() - start, training_seconds
+            )
+            return 1.0 - fraction * (1.0 - trainer.args.lrf)
+
+        trainer.lf = factor  # Ultralytics warmup uses the same factor as the epoch scheduler.
+        trainer.scheduler.lr_lambdas = [factor] * len(trainer.optimizer.param_groups)
 
     def stop_at_budget(trainer):
+        nonlocal timed_out
         if time.monotonic() - start >= training_seconds:
+            timed_out = True
             trainer.stop = True
 
+    model.add_callback("on_train_start", adapt_schedule)
     model.add_callback("on_train_batch_end", stop_at_budget)
     model.add_callback("on_train_epoch_end", stop_at_budget)
     arguments = recipe.model_dump(exclude={"id", "hypothesis", "model"})
@@ -66,6 +85,7 @@ def train_job(job):
         best, cfg.dataset_dir, "val", cfg.evaluation, cfg.device, recipe.imgsz
     )
     metrics.update(
+        localization=localization_report(frames, cfg.evaluation.ball_class_id),
         parameters=parameters,
         checkpoint_bytes=checkpoint.stat().st_size,
         checkpoint=str(checkpoint),
@@ -73,6 +93,19 @@ def train_job(job):
         seed=job["seed"],
         epochs_completed=model.trainer.epoch + 1,
         runtime_seconds=time.monotonic() - start,
+        training={
+            "requested_epochs": recipe.epochs,
+            "completed_epochs": model.trainer.epoch + 1,
+            "seconds_allowed": training_seconds,
+            "stop_reason": "time_budget"
+            if timed_out
+            else "epochs_complete"
+            if model.trainer.epoch + 1 >= recipe.epochs
+            else "early_stopping",
+            "schedule": "epoch-or-time-linear-v1",
+            "first_epoch": progress.history[0] if progress.history else None,
+            "last_epoch": progress.history[-1] if progress.history else None,
+        },
     )
     save_json(folder / "predictions.json", frames)
     save_json(folder / "metrics.json", metrics)

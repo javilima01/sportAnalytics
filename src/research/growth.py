@@ -5,7 +5,7 @@ import time
 
 from pydantic import Field
 
-from .acquisition import acquire, discover
+from .acquisition import acquire, discover, known_sources
 from .config import Settings, Source
 from .controller import freeze_dataset, load_state, rank, remaining_seconds, run_campaign
 from .providers import ProviderWaitExhausted
@@ -75,16 +75,22 @@ def grow_training(cfg, agent, directory, feedback):
             timeout=min(cfg.acquisition.agent_timeout_seconds, deadline - time.monotonic()),
         ).model_dump()
         save_json(directory / "plan.json", plan)
+    split = plan.get("split", "train")
+    if split not in ("train", "val", "test"):
+        raise ValueError("Unknown collection split.")
+    if split != "train" and not (cfg.autonomy.enabled and cfg.autonomy.allow_benchmark_growth):
+        raise ValueError("Autonomous validation/test growth is disabled.")
     selected = read_json(directory / "sources.json")
     if selected is None:
-        existing = read_json(cfg.output_dir / "acquisition.json", {}).get("sources", [])
+        existing = known_sources(cfg)
         sources = discover(
             cfg,
             agent,
             deadline,
             folder=directory / "discovery",
             queries=plan["queries"],
-            training_only=True,
+            training_only=split == "train",
+            target_split=split,
             existing=existing,
             limit=cfg.data_growth.sources_per_round,
         )
@@ -96,12 +102,14 @@ def grow_training(cfg, agent, directory, feedback):
             agent,
             training_sources=[Source.model_validate(s) for s in selected],
             deadline=deadline,
+            growth_split=split,
         )
-    snapshot = freeze_dataset(cfg, allow_training_growth=True)
+    snapshot = freeze_dataset(cfg, allow_growth_splits={split})
     before = read_json(directory / "before.json")
     result = {
         "reason": plan["reason"],
-        "added_images": snapshot["counts"]["train"]["images"] - before["counts"]["train"]["images"],
+        "split": split,
+        "added_images": snapshot["counts"][split]["images"] - before["counts"][split]["images"],
         "dataset_version": snapshot["version"],
         "sources": len(selected),
     }

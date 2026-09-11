@@ -162,7 +162,7 @@ def run_research(args):
     if args.action == "status":
         print(json.dumps(status(cfg), indent=2))
         return
-    with campaign_lock(cfg.output_dir):
+    with campaign_lock(cfg.output_dir), campaign_lock(cfg.dataset_dir):
         initialize(cfg)
         if args.action in ("init", "auto"):
             from src.research.autonomous import run_autonomous

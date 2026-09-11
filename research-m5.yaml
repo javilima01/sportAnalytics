@@ -1,4 +1,4 @@
-# Run: python main.py research init
+# Run: caffeinate -i python main.py research init --config research-m5.yaml
 # Starts/resumes acquisition, automatic labeling, experiments, and final evaluation.
 # Settings are frozen when the campaign is initialized. Comments can be edited freely;
 # Changing user settings afterward requires a new campaign; agent budget changes use a separate journal.
@@ -6,9 +6,9 @@
 # Relative paths below resolve from the directory containing this file.
 
 # Name identifying this research campaign.
-campaign_id: football-autonomous
+campaign_id: football-m5-autonomous
 # Stores campaign state, trials, checkpoints, logs, and dataset-version records.
-output_dir: experiments/football-autonomous
+output_dir: experiments/football-m5-autonomous
 # Use the previous run as evidence and permit warm starts; old scores are not new acceptance evidence.
 prior_campaign: experiments/football-m5
 # Images, labels, manifest, and data.yaml used by this campaign.
@@ -18,7 +18,8 @@ dataset_dir: datasets/football-astra-high
 # Use the Mac's Apple GPU through PyTorch MPS for detection/training.
 device: mps
 # Number of data-loader subprocesses; this is not the number of research agents.
-workers: 4
+# M5 Pro 18 cores / 64GB: 8 feeds 1280px training without oversubscribing MPS.
+workers: 8
 # CLI command (or full executable path) used to launch the primary research agent.
 codex_executable: codex
 # Model explicitly passed to the Codex CLI for research/annotation requests.
@@ -173,8 +174,9 @@ budget:
 # Initial student recipes. Among models passing every gate, fewer parameters win.
 # In adaptive mode these define allowed checkpoints and starting suggestions, not a fixed queue.
 # The agent may adjust their settings immediately; it need not try every model size.
-# Shared defaults omitted below: batch=4, epochs=100, lr0=0.001, optimizer=AdamW,
+# Shared defaults omitted below: epochs=100, lr0=0.001, optimizer=AdamW,
 # mosaic=0.5, scale=0.5, degrees=0. Confirmation overrides epochs with its own limit.
+# Batch is an initial suggestion; the agent may adjust it using measured runtime and failures.
 recipes:
   # Unique recipe ID used in experiment records.
   - id: nano640
@@ -184,6 +186,7 @@ recipes:
     model: models/yolov8n.pt
     # Student training/evaluation image-size setting in pixels (not stored-image dimensions).
     imgsz: 640
+    batch: 8
   # Second recipe: same small architecture, with a larger input image size.
   - id: nano960
     # Test whether additional image detail improves detection of small balls.
@@ -192,6 +195,7 @@ recipes:
     model: models/yolov8n.pt
     # Higher resolution generally requires more compute and memory than 640.
     imgsz: 960
+    batch: 8
   # Third recipe: YOLOv8 small.
   - id: s640
     # Test whether the small architecture passes the same unchanged gates.
@@ -200,6 +204,7 @@ recipes:
     model: models/yolov8s.pt
     # Student input image-size setting.
     imgsz: 640
+    batch: 8
   # Fourth recipe: YOLOv8 medium.
   - id: m640
     # Test whether the medium architecture passes the same unchanged gates.
@@ -208,6 +213,7 @@ recipes:
     model: models/yolov8m.pt
     # Student input image-size setting.
     imgsz: 640
+    batch: 8
   # Fifth recipe: YOLOv8 large.
   - id: l640
     # Test whether the large architecture passes the same unchanged gates.
@@ -216,6 +222,7 @@ recipes:
     model: models/yolov8l.pt
     # Student input image-size setting.
     imgsz: 640
+    batch: 8
   # Sixth recipe: YOLOv8 extra-large, still subject to the preference for smaller passing models.
   - id: x640
     # Test whether the extra-large architecture passes the same unchanged gates.
@@ -224,3 +231,4 @@ recipes:
     model: models/yolov8x.pt
     # Student input image-size setting; the teacher separately uses 1280.
     imgsz: 640
+    batch: 8

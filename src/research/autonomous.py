@@ -15,7 +15,7 @@ from .runtime import read_json, run_process, save_json
 def run_autonomous(
     cfg, *, agent=None, executor=run_process, collector=acquire, grower=grow_training
 ):
-    """Resume stages under the caller's campaign lock; never expand configured budgets."""
+    """Resume stages under the caller's lock, including audited agent budget extensions."""
     initialize(cfg)
     path = cfg.output_dir / "autonomous.json"
     workflow = read_json(
@@ -74,6 +74,23 @@ def run_autonomous(
                     time.sleep(delay)
                 record(stage, "Retrying agent work after its quota cooldown.")
 
+    def return_to_agent(reason):
+        from .allowances import effective_campaign
+
+        working = effective_campaign(cfg)
+        if (
+            cfg.diagnostics.enabled
+            and cfg.proposals == "codex"
+            and cfg.autonomy.enabled
+            and workflow.get("decision_count", 0) < working.diagnostics.max_decisions
+        ):
+            workflow["completed_phases"] = []
+            record("explore", f"Returning to the agent for adjustments: {reason}")
+            return run_autonomous(
+                cfg, agent=agent, executor=executor, collector=collector, grower=grower
+            )
+        return None
+
     try:
         # A recorded final test is terminal even if the orchestration process died afterwards.
         if (cfg.output_dir / "final_test.json").exists():
@@ -88,7 +105,7 @@ def run_autonomous(
 
         # Only inadequate coverage permits more acquisition. Corruption/leakage remains an error.
         while True:
-            if workflow.get("growth_pending"):
+            if workflow.get("growth_pending") or workflow.get("review_pending"):
                 break  # Finish the reserved append-only transaction before checking its new snapshot.
             if (cfg.output_dir / "snapshot.json").exists():
                 freeze_dataset(cfg)
@@ -147,6 +164,9 @@ def run_autonomous(
                     )
                 )
             except ConfirmationIncomplete as error:
+                resumed = return_to_agent(str(error))
+                if resumed is not None:
+                    return resumed
                 record(phase, str(error), "stopped")
                 return workflow
             completed = [
@@ -157,6 +177,11 @@ def run_autonomous(
                 and r.get("dataset_version") == state.get("dataset_version")
             ]
             if not completed:
+                resumed = return_to_agent(
+                    f"No completed {phase} candidate; check working budgets and failures."
+                )
+                if resumed is not None:
+                    return resumed
                 record(
                     phase,
                     "No completed candidate: the available trial budget was exhausted "
@@ -172,6 +197,9 @@ def run_autonomous(
         try:
             result = finalize(cfg, executor=executor)
         except ConfirmationIncomplete as error:
+            resumed = return_to_agent(str(error))
+            if resumed is not None:
+                return resumed
             record(
                 "confirm",
                 str(error) + " Quality or remaining budget was insufficient; "

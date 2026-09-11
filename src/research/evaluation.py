@@ -11,6 +11,48 @@ from ultralytics.utils.metrics import ap_per_class
 from ..dataset import IMAGE_SUFFIXES, read_labels, read_names
 
 
+def closest_prediction(target, predictions, class_id):
+    candidates = [p for p in predictions if p[0] == class_id]
+    if not candidates:
+        return None, 0.0
+    boxes = np.asarray([p[2:] for p in candidates])
+    target = np.asarray(target)
+    intersection = np.maximum(
+        0, np.minimum(boxes[:, 2:], target[2:]) - np.maximum(boxes[:, :2], target[:2])
+    ).prod(axis=1)
+    union = (
+        (boxes[:, 2:] - boxes[:, :2]).prod(axis=1) + (target[2:] - target[:2]).prod() - intersection
+    )
+    ious = intersection / np.maximum(union, 1e-12)
+    best = int(np.argmax(ious))
+    return candidates[best], float(ious[best])
+
+
+def localization_report(frames, class_id):
+    """Nearest-box evidence; these relaxed overlaps are never acceptance metrics."""
+    targets = []
+    for frame in frames:
+        for target in frame["targets"]:
+            if target[0] == class_id:
+                prediction, overlap = closest_prediction(target[1:], frame["predictions"], class_id)
+                targets.append(
+                    {
+                        "image": frame["image"],
+                        "target": target[1:],
+                        "best_iou": overlap,
+                        "prediction": prediction,
+                    }
+                )
+    return {
+        "interpretation": "Diagnostic nearest-box overlap at inference confidence >=0.001; not one-to-one AP/recall.",
+        "targets": len(targets),
+        "overlap_at_least_025": sum(t["best_iou"] >= 0.25 for t in targets),
+        "overlap_at_least_040": sum(t["best_iou"] >= 0.4 for t in targets),
+        "overlap_at_least_050": sum(t["best_iou"] >= 0.5 for t in targets),
+        "examples": targets[:16],
+    }
+
+
 def match_detections(predictions, targets, thresholds):
     """Confidence-ordered, one-to-one matching; arrays: cls/conf/xyxy and cls/xyxy."""
     predictions = np.asarray(predictions, dtype=float).reshape(-1, 6)

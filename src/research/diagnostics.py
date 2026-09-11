@@ -84,6 +84,7 @@ def run_diagnostic(cfg, kind, trial, directory, executor=run_process):
             "dataset_version": read_json(cfg.output_dir / "snapshot.json")["version"],
             "source_hashes": source_fingerprint(),
             "trial_id": trial["id"] if trial else None,
+            "trial_dataset_version": trial.get("dataset_version") if trial else None,
         },
     )
     start = time.monotonic()
@@ -153,8 +154,24 @@ def inspect_data(cfg, trial, folder):
     from ultralytics.data.augment import RandomPerspective
     from ultralytics.data.dataset import YOLODataset
 
+    from .evaluation import closest_prediction, localization_report
+
     recipe = Recipe.model_validate(trial["recipe"]) if trial else cfg.recipes[0]
     summary = {"imgsz": recipe.imgsz, "splits": {}, "annotation_accuracy_verified": False}
+    trial_dir = cfg.output_dir / trial["id"] if trial else None
+    if trial and trial["id"].startswith("prior/"):
+        trial_dir = cfg.prior_campaign / trial["id"].removeprefix("prior/")
+    same_data = trial and trial.get("dataset_version") == read_json(
+        cfg.output_dir / "snapshot.json", {}
+    ).get("version")
+    predictions = read_json(trial_dir / "predictions.json", []) if same_data else []
+    by_image = {f["image"]: f["predictions"] for f in predictions}
+    summary["validation_localization"] = localization_report(
+        predictions, cfg.evaluation.ball_class_id
+    )
+    summary["montage_legend"] = (
+        "Red: annotation; blue: closest overlapping student prediction on validation only."
+    )
     for split in ("train", "val"):
         sizes, counts = [], np.zeros(len(cfg.names), dtype=int)
         for path in sorted((cfg.dataset_dir / "images" / split).iterdir()):
@@ -203,10 +220,30 @@ def inspect_data(cfg, trial, folder):
                     (0, 0, 255),
                     1,
                 )
+                overlap = None
+                if split == "val" and predictions:
+                    candidate, overlap = closest_prediction(
+                        (x1, y1, x2, y2), by_image.get(path.name, []), cfg.evaluation.ball_class_id
+                    )
+                    if candidate and overlap > 0:
+                        a, b, c, d = candidate[2:]
+                        cv2.rectangle(
+                            crop,
+                            (round(a - left), round(b - top)),
+                            (round(c - left), round(d - top)),
+                            (255, 160, 0),
+                            1,
+                        )
                 tile = np.full((240, 240, 3), 255, np.uint8)
                 tile[:216] = cv2.resize(crop, (240, 216))
                 cv2.putText(
-                    tile, str(len(tiles)), (4, 235), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 0, 0), 1
+                    tile,
+                    str(len(tiles)) + (f" IoU={overlap:.3f}" if overlap is not None else ""),
+                    (4, 235),
+                    cv2.FONT_HERSHEY_SIMPLEX,
+                    0.5,
+                    (0, 0, 0),
+                    1,
                 )
                 tiles.append(tile)
         if tiles:
@@ -346,15 +383,15 @@ def crop_overfit(cfg, trial, folder, seconds):
 def diagnostic_job(job):
     from ultralytics import YOLO
 
-    from .evaluation import evaluate
+    from .evaluation import evaluate, summarize
 
     cfg, folder = Campaign.model_validate(job["campaign"]), Path(job["folder"])
     trial, kind = job.get("trial"), job["diagnostic"]
     if kind == "inspect_data":
         result = inspect_data(cfg, trial, folder)
-    elif kind == "evaluate_train":
-        paths = selected_images(cfg, "train")
-        metrics, _ = evaluate(
+    elif kind in ("evaluate_train", "evaluate_train_full"):
+        paths = selected_images(cfg, "train") if kind == "evaluate_train" else None
+        metrics, frames = evaluate(
             YOLO(trial["metrics"]["checkpoint"]),
             cfg.dataset_dir,
             "train",
@@ -363,13 +400,32 @@ def diagnostic_job(job):
             trial["recipe"]["imgsz"],
             image_paths=paths,
         )
+        total = sum(
+            json.loads(line)["split"] == "train"
+            for line in (cfg.dataset_dir / "manifest.jsonl").read_text().splitlines()
+        )
+        fixed = summarize(
+            frames,
+            dict(enumerate(cfg.names)),
+            cfg.evaluation,
+            confidence=trial["metrics"]["confidence"],
+        )
+        save_json(folder / "training-predictions.json", frames)
         result = {
-            "interpretation": "Sampled training-set fit, not generalization.",
-            "images": len(paths),
+            "interpretation": "Training-label fit, not generalization. A targeted sample cannot rule out full-dataset underfitting or capacity limitations.",
+            "selection": "ball-positive, match-prioritized sample"
+            if paths
+            else "all training images",
+            "complete_training_set": paths is None or len(frames) == total,
+            "images": len(frames),
+            "total_training_images": total,
+            "source_images": [p.name for p in paths] if paths else [],
             "ball": metrics["ball"],
             "macro": metrics["macro"],
             "confidence": metrics["confidence"],
             "validation_ball": trial["metrics"]["ball"],
+            "recorded_validation_dataset_version": trial.get("dataset_version"),
+            "at_validation_confidence": {"confidence": fixed["confidence"], "ball": fixed["ball"]},
         }
     elif kind == "overfit_crops":
         result = crop_overfit(cfg, trial, folder, job["seconds"])

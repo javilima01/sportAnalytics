@@ -87,8 +87,8 @@ class Evaluation(Settings):
 
 
 class Budget(Settings):
-    exploration_minutes: float = Field(15, gt=0, le=30)
-    promotion_minutes: float = Field(30, gt=0, le=30)
+    exploration_minutes: float = Field(15, gt=0, le=1440)
+    promotion_minutes: float = Field(30, gt=0, le=1440)
     confirmation_minutes: float = Field(120, gt=0)
     evaluation_reserve_seconds: float = Field(120, gt=0)
     max_trials: int = Field(20, ge=1)
@@ -112,7 +112,7 @@ class Fallback(Settings):
 class DataGrowth(Settings):
     enabled: bool = True
     min_train_images: int = Field(48, ge=1)
-    max_rounds: int = Field(3, ge=0, le=10)
+    max_rounds: int = Field(3, ge=0, le=100)
     sources_per_round: int = Field(3, ge=1, le=10)
     trials_per_round: int = Field(2, ge=1)
 
@@ -126,9 +126,30 @@ class Diagnostics(Settings):
     max_decisions: int = Field(32, ge=1, le=200)
 
 
+class Autonomy(Settings):
+    """The agent may raise working allowances up to these user-owned ceilings."""
+
+    enabled: bool = True
+    allow_benchmark_growth: bool = True
+    allow_label_review: bool = True
+    max_trial_minutes: float = Field(240, gt=0, le=1440)
+    max_hours: float = Field(72, gt=0)
+    max_trials: int = Field(80, ge=1)
+    max_exploration_trials: int = Field(60, ge=1)
+    max_data_rounds: int = Field(30, ge=0, le=100)
+    max_acquisition_minutes: float = Field(60, gt=0)
+    max_download_gb: float = Field(50, gt=0)
+    max_storage_gb: float = Field(100, gt=0)
+    max_diagnostic_actions: int = Field(50, ge=0, le=100)
+    max_diagnostic_minutes: float = Field(15, gt=0, le=15)
+    max_diagnostic_total_minutes: float = Field(120, gt=0)
+    max_decisions: int = Field(200, ge=1, le=200)
+
+
 class Campaign(Settings):
     campaign_id: str = Field("football-pilot", pattern=r"^[a-zA-Z0-9_-]+$")
     output_dir: Path = Path("experiments/football-pilot")
+    prior_campaign: Path | None = None
     dataset_dir: Path = Path("datasets/football-pilot")
     device: str = "mps"
     workers: int = Field(2, ge=0)
@@ -148,6 +169,7 @@ class Campaign(Settings):
     budget: Budget = Field(default_factory=Budget)
     data_growth: DataGrowth = Field(default_factory=DataGrowth)
     diagnostics: Diagnostics = Field(default_factory=Diagnostics)
+    autonomy: Autonomy = Field(default_factory=Autonomy)
     recipes: list[Recipe] = Field(
         default_factory=lambda: [
             Recipe(id="nano640", hypothesis="Establish a small-model baseline."),
@@ -181,6 +203,10 @@ def load_campaign(path):
     for field in ("output_dir", "dataset_dir"):
         value = getattr(cfg, field)
         setattr(cfg, field, (path.parent / value).resolve())
+    if cfg.prior_campaign is not None:
+        cfg.prior_campaign = (path.parent / cfg.prior_campaign).resolve()
+        if cfg.prior_campaign == cfg.output_dir:
+            raise ValueError("Prior campaign must differ from the new output directory.")
     if (
         cfg.output_dir == cfg.dataset_dir
         or cfg.output_dir in cfg.dataset_dir.parents

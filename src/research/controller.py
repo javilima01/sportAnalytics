@@ -33,7 +33,9 @@ def initialize(cfg):
     save_json(path, value)
 
 
-def freeze_dataset(cfg, *, allow_training_growth=False):
+def freeze_dataset(
+    cfg, *, allow_training_growth=False, allow_growth_splits=(), label_revision=None
+):
     from ..dataset import read_names
 
     if list(read_names(cfg.dataset_dir / "data.yaml").values()) != cfg.names:
@@ -47,8 +49,15 @@ def freeze_dataset(cfg, *, allow_training_growth=False):
     versions = cfg.output_dir / "dataset_versions"
     yaml_hash = file_hash(cfg.dataset_dir / "data.yaml")
     if previous is not None and previous != snapshot:
+        allowed = set(allow_growth_splits) | ({"train"} if allow_training_growth else set())
+        if allowed - {"train", "val", "test"}:
+            raise ValueError("Unknown growth split.")
+        if allowed - {"train"} and not (
+            cfg.autonomy.enabled and cfg.autonomy.allow_benchmark_growth
+        ):
+            raise ValueError("Autonomous validation/test growth is disabled.")
         if (
-            not allow_training_growth
+            not (allowed or label_revision)
             or not cfg.data_growth.enabled
             or (cfg.output_dir / "final_test.json").exists()
         ):
@@ -58,14 +67,37 @@ def freeze_dataset(cfg, *, allow_training_growth=False):
             raise ValueError("Frozen dataset metadata changed.")
         before = {r["image"]: r for r in old["records"]}
         after = {r["image"]: r for r in records}
-        if any(after.get(key) != value for key, value in before.items()):
+        if label_revision:
+            revision = read_json(label_revision)
+            if not (cfg.autonomy.enabled and cfg.autonomy.allow_label_review):
+                raise ValueError("Autonomous label review is disabled.")
+            if revision["before_records"] != old["records"] or revision["after_records"] != records:
+                raise ValueError("Label revision does not match the frozen dataset transition.")
+            if set(before) != set(after) or any(
+                {k: v for k, v in before[key].items() if k not in revision["mutable_fields"]}
+                != {k: v for k, v in after[key].items() if k not in revision["mutable_fields"]}
+                for key in before
+            ):
+                raise ValueError("Label review must preserve images and split assignments.")
+            if set(revision["mutable_fields"]) != {"label_sha256", "agent_record", "agent_sha256"}:
+                raise ValueError("Label revision has invalid mutable fields.")
+        elif any(after.get(key) != value for key, value in before.items()):
             raise ValueError("Existing frozen images or labels changed during training growth.")
-        if any(r["split"] != "train" for key, r in after.items() if key not in before):
-            raise ValueError("Validation and test data cannot grow after freezing.")
-    save_json(
-        versions / f"{snapshot['version']}.json",
-        {"snapshot": snapshot, "yaml_sha256": yaml_hash, "records": records},
-    )
+        if any(r["split"] not in allowed for key, r in after.items() if key not in before):
+            raise ValueError(
+                "Validation and test data cannot grow outside an authorized split transition."
+            )
+    version_path = versions / f"{snapshot['version']}.json"
+    if not version_path.exists():
+        save_json(
+            version_path,
+            {
+                "snapshot": snapshot,
+                "yaml_sha256": yaml_hash,
+                "records": records,
+                "label_revision": str(label_revision) if label_revision else None,
+            },
+        )
     save_json(path, snapshot)
     return snapshot
 
@@ -184,6 +216,9 @@ def run_trial(cfg, state, recipe, phase, seed, timeout, executor=run_process):
         "seconds": 0,
         "reserved_seconds": timeout,
         "dataset_version": read_json(cfg.output_dir / "snapshot.json", {}).get("version"),
+        "benchmark_version": read_json(cfg.output_dir / "snapshot.json", {}).get(
+            "benchmark_version"
+        ),
     }
     state["trials"].append(record)
     persist(cfg, state)
@@ -265,8 +300,12 @@ def run_campaign(
     retry_interrupted=False,
     phase_trial_limit=None,
     recipes_override=None,
+    minutes_override=None,
 ):
     initialize(cfg)
+    from .allowances import effective_campaign, trial_minutes
+
+    cfg = effective_campaign(cfg)
     if (cfg.output_dir / "final_test.json").exists():
         raise ValueError("Final test has been opened; this campaign is closed to further trials.")
     if not (cfg.dataset_dir / "manifest.jsonl").exists():
@@ -306,7 +345,7 @@ def run_campaign(
                     else 2
                 )
             )
-        minutes = cfg.budget.exploration_minutes
+        minutes = trial_minutes(cfg, minutes_override)
     else:
         parent_phase = (
             "promote" if phase == "confirm" and "promote" in state["incumbents"] else "explore"
@@ -407,6 +446,9 @@ def run_campaign(
 
 def finalize(cfg, executor=run_process):
     initialize(cfg)
+    from .allowances import effective_campaign
+
+    cfg = effective_campaign(cfg)
     snapshot = freeze_dataset(cfg)
     if read_json(cfg.output_dir / "source_hashes.json") != source_fingerprint():
         raise ValueError("Experiment code changed; final testing requires the frozen evaluator.")
@@ -474,6 +516,8 @@ def finalize(cfg, executor=run_process):
 
 
 def status(cfg):
+    from .allowances import budget_ceilings, budget_values, effective_campaign
+
     return {
         "campaign": cfg.campaign_id,
         "workflow": read_json(cfg.output_dir / "autonomous.json"),
@@ -482,4 +526,7 @@ def status(cfg):
         "experiments": read_json(cfg.output_dir / "state.json"),
         "diagnostics": read_json(cfg.output_dir / "diagnostics/state.json", []),
         "final_test": read_json(cfg.output_dir / "final_test.json"),
+        "working_budgets": budget_values(effective_campaign(cfg)),
+        "budget_ceilings": budget_ceilings(cfg),
+        "budget_changes": read_json(cfg.output_dir / "budget_changes.json", []),
     }

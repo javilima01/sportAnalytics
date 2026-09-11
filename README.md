@@ -117,15 +117,26 @@ Edit it before first launch to choose budgets, source queries and checkpoints.
 The agent discovers videos when no URLs are
 supplied and corrects every accepted image's labels; no human labeling is required.
 Defaults use this Mac's MPS device, 15-minute exploration trials and a pilot dataset.
-Later stages automatically use 30-minute promotion and longer confirmation runs.
-It stops if its budgets are exhausted or quality remains insufficient.
+The agent can request longer training, start from saved checkpoints, and increase working
+budgets within the `autonomy` ceilings. Changes persist in `budget_changes.json`.
 
-By default, `data_growth` collects at least 48 accepted training images and
-reassesses data needs after every two exploration trials. Validation failures can
-trigger new training-video searches and automatic labeling, within three extra
-collection rounds and the same download budget. Validation/test data stay fixed;
-each training-data version and its trial results are recorded. Promotion and
-confirmation use the current version, then the agent tests the final model once.
+With diagnostics enabled, the agent chooses after each action whether to train,
+evaluate full training fit, collect new train/validation/test matches, review labels
+automatically, or adjust budgets. Dataset and benchmark changes are versioned;
+original labels are preserved in review journals. Promotion and confirmation require
+current-version results. Student test predictions remain unavailable until final testing.
+
+For this Mac's prepared configuration, run:
+
+```bash
+caffeinate -i python main.py research init --config research-m5.yaml
+```
+
+It starts `football-m5-autonomous`, reuses the existing dataset, and reads the previous
+M5 campaign as historical evidence and a source of warm-start checkpoints. Typical
+trials start at 30 minutes; the agent can extend individual training runs to four hours
+and campaign trial/diagnostic compute to 72 hours when justified. These are ceilings,
+not durations that every experiment will consume. Use the same `--config` for status.
 
 Keep the terminal open and the computer awake. Run the same `init` command to
 resume after interruption; use `python main.py research status` from another
