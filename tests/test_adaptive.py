@@ -304,6 +304,18 @@ def test_decision_payloads_cannot_smuggle_unrelated_actions():
         ResearchDecision(action="diagnose", reason="check", diagnostic="read_test")
 
 
+def test_all_null_budget_update_is_treated_as_absent():
+    recipe = Recipe(id="baseline", hypothesis="baseline")
+    decision = ResearchDecision(
+        action="train", reason="baseline", recipe=recipe, budget_update={"decisions": None}
+    )
+    assert decision.budget_update is None
+    with pytest.raises(ValidationError, match="Only adjust_budget"):
+        ResearchDecision(
+            action="train", reason="baseline", recipe=recipe, budget_update={"decisions": 5}
+        )
+
+
 def test_recipe_exposes_augmentation_and_optimization_knobs():
     recipe = Recipe(
         id="knobs",

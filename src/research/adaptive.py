@@ -46,6 +46,8 @@ class ResearchDecision(Settings):
 
     @model_validator(mode="after")
     def payload(self):
+        if self.budget_update is not None and not self.budget_update.model_dump(exclude_none=True):
+            self.budget_update = None
         if (self.recipe is not None) != (self.action == "train"):
             raise ValueError("Only train actions require a recipe.")
         if (self.diagnostic is not None) != (self.action == "diagnose"):

@@ -6,9 +6,9 @@
 # Relative paths below resolve from the directory containing this file.
 
 # Name identifying this research campaign.
-campaign_id: football-deepseek
+campaign_id: football-deepseek-v2
 # Stores campaign state, trials, checkpoints, logs, and dataset-version records.
-output_dir: experiments/football-deepseek
+output_dir: football-deepseek-v2
 # Use the previous run as evidence and permit warm starts; old scores are not new acceptance evidence.
 prior_campaign: football-m5-autonomous
 # Images, labels, manifest, and data.yaml used by this campaign.
