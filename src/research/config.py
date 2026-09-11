@@ -34,10 +34,28 @@ class Recipe(Settings):
     batch: int = Field(4, ge=1, le=32)
     epochs: int = Field(100, ge=1, le=1000)
     lr0: float = Field(0.001, gt=0, le=0.1)
+    lrf: float = Field(0.01, gt=0, le=1)
     optimizer: Literal["AdamW", "SGD", "auto"] = "AdamW"
+    weight_decay: float = Field(0.0005, ge=0, le=0.01)
+    warmup_epochs: float = Field(3.0, ge=0, le=20)
+    patience: int = Field(30, ge=1, le=500)
+    dropout: float = Field(0.0, ge=0, le=0.5)
     mosaic: float = Field(0.5, ge=0, le=1)
-    scale: float = Field(0.5, ge=0, le=1)
+    close_mosaic: int = Field(0, ge=0, le=100)
+    mixup: float = Field(0.0, ge=0, le=1)
+    copy_paste: float = Field(0.0, ge=0, le=1)
+    # Random erasing keeps labels while deleting pixels; harmful for tiny objects.
+    erasing: float = Field(0.4, ge=0, le=1)
+    hsv_h: float = Field(0.015, ge=0, le=1)
+    hsv_s: float = Field(0.7, ge=0, le=1)
+    hsv_v: float = Field(0.4, ge=0, le=1)
     degrees: float = Field(0, ge=0, le=15)
+    translate: float = Field(0.1, ge=0, le=0.9)
+    scale: float = Field(0.5, ge=0, le=1)
+    shear: float = Field(0.0, ge=0, le=10)
+    perspective: float = Field(0.0, ge=0, le=0.001)
+    flipud: float = Field(0.0, ge=0, le=1)
+    fliplr: float = Field(0.5, ge=0, le=1)
 
 
 class Acquisition(Settings):
@@ -195,6 +213,15 @@ class Campaign(Settings):
         if self.evaluation.ball_class_id >= len(self.names):
             raise ValueError("Ball class ID is outside the taxonomy.")
         return self
+
+
+def base_models(cfg):
+    """Configured checkpoints plus existing architecture/weight files in their directories."""
+    models = {r.model for r in cfg.recipes}
+    for directory in {Path(model).parent for model in models}:
+        for pattern in ("*.pt", "*.yaml"):
+            models.update(str(path) for path in sorted(directory.glob(pattern)))
+    return models
 
 
 def load_campaign(path):

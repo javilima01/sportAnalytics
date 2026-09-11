@@ -44,7 +44,14 @@ those stages; unsuccessful promotion/confirmation can return to exploration.
 Use `adjust_budget` to increase working allowances within the explicit `autonomy`
 ceilings. Every increase is audited in `budget_changes.json`; do not reset consumed
 work or edit the contract. `train.minutes` can request a longer run. Registered
-warm-start checkpoints continue learned weights with a fresh optimizer/schedule.
+warm-start checkpoints continue learned weights with a fresh optimizer/schedule;
+repeating settings identical to a completed trial on the current dataset version
+is rejected unless every such trial stopped on its time budget. Recipes also
+control augmentation (mosaic, close_mosaic, mixup, copy_paste, erasing, hsv,
+geometry, flips) and optimization (lr0, lrf, weight_decay, warmup, patience,
+dropout); `model` may be any `.pt`/`.yaml` in the model directories. The evidence
+payload includes deterministic signals (best current trial, validation span,
+plateau, repeated settings, train–validation gap) — trust them over re-deriving.
 Read prior-campaign evidence instead of blindly repeating its failed baselines.
 
 Keep the objective fixed: minimize student parameters subject to every macro and

@@ -67,12 +67,10 @@ def train_job(job):
         project=str(folder),
         name="training",
         exist_ok=True,
-        patience=30,
         plots=False,
         amp=False,
         save=True,
         val=True,
-        close_mosaic=0,
     )
     checkpoint = Path(model.trainer.best)
     if not checkpoint.is_file():

@@ -6,11 +6,12 @@ from pathlib import Path
 
 import pytest
 from pydantic import ValidationError
-from test_research import append_growth_image, fake_worker
+from test_research import append_growth_image, fake_worker, good_metrics
 from test_research import campaign as campaign
 
 from src.research.adaptive import ResearchDecision
 from src.research.autonomous import run_autonomous
+from src.research.config import Campaign, Recipe, base_models
 from src.research.controller import freeze_dataset, remaining_seconds, run_campaign
 from src.research.diagnostics import diagnostic_allowance, run_diagnostic, selected_images
 from src.research.runtime import read_json, save_json
@@ -301,6 +302,143 @@ def test_decision_payloads_cannot_smuggle_unrelated_actions():
         ResearchDecision(action="stop", reason="done", queries=["download"])
     with pytest.raises(ValidationError):
         ResearchDecision(action="diagnose", reason="check", diagnostic="read_test")
+
+
+def test_recipe_exposes_augmentation_and_optimization_knobs():
+    recipe = Recipe(
+        id="knobs",
+        hypothesis="full hyperparameter control",
+        erasing=0.0,
+        hsv_v=0.2,
+        copy_paste=0.5,
+        mixup=0.1,
+        shear=2.0,
+        perspective=0.0005,
+        translate=0.2,
+        fliplr=0.0,
+        close_mosaic=10,
+        patience=50,
+        lrf=0.1,
+        weight_decay=0.001,
+        warmup_epochs=1.5,
+        dropout=0.1,
+    )
+    assert recipe.erasing == 0.0 and recipe.patience == 50 and recipe.hsv_v == 0.2
+    with pytest.raises(ValidationError):
+        Recipe(id="bad", hypothesis="x", erasing=1.5)
+    with pytest.raises(ValidationError):
+        Recipe(id="bad", hypothesis="x", perspective=0.01)
+    with pytest.raises(ValidationError):
+        Recipe(id="bad", hypothesis="x", patience=0)
+
+
+def test_base_models_include_neighbor_architectures(tmp_path):
+    checkpoint = tmp_path / "yolov8n.pt"
+    checkpoint.write_bytes(b"fixture checkpoint")
+    variant = tmp_path / "yolov8-p2.yaml"
+    variant.write_text("nc: 2")
+    cfg = Campaign(recipes=[Recipe(id="a", hypothesis="h", model=str(checkpoint))])
+    models = base_models(cfg)
+    assert str(checkpoint) in models and str(variant) in models
+
+
+def warm_start_worker(command, **kwargs):
+    job = read_json(command[-1])
+    if job["kind"] == "diagnostic":
+        save_json(Path(job["folder"]) / "result.json", {"marker": "diagnostic evidence"})
+        return
+    checkpoint = Path(job["folder"]) / "weights" / "best.pt"
+    checkpoint.parent.mkdir(parents=True, exist_ok=True)
+    checkpoint.write_bytes(b"trained weights")
+    save_json(Path(job["folder"]) / "metrics.json", good_metrics(checkpoint))
+
+
+def test_warm_start_repeat_of_converged_settings_is_rejected(campaign):
+    enable(campaign)
+    recipe = campaign.recipes[0].model_dump()
+    warm = str(campaign.output_dir / "trial-0001" / "weights" / "best.pt")
+    agent = ScriptedAgent(
+        [
+            {"action": "train", "recipe": recipe},
+            {"action": "train", "recipe": {**recipe, "id": "warm", "model": warm}},
+            {
+                "action": "train",
+                "recipe": {**recipe, "id": "warm-erasing-off", "model": warm, "erasing": 0.0},
+            },
+            {"action": "stop"},
+        ]
+    )
+    result = run_autonomous(campaign, agent=agent, executor=warm_start_worker)
+    assert result["status"] == "stopped"
+    trials = read_json(campaign.output_dir / "state.json")["trials"]
+    assert [r["recipe"]["id"] for r in trials] == ["baseline", "warm-erasing-off"]
+    rejected = agent.evidence[2]["previous_decisions"][-1]
+    assert rejected["action"] == "rejected" and "converged settings" in rejected["reason"]
+
+
+def test_warm_start_continues_time_limited_settings(campaign):
+    enable(campaign)
+    recipe = campaign.recipes[0].model_dump()
+    warm = str(campaign.output_dir / "trial-0001" / "weights" / "best.pt")
+    agent = ScriptedAgent(
+        [
+            {"action": "train", "recipe": recipe},
+            {"action": "train", "recipe": {**recipe, "id": "continued", "model": warm}},
+            {"action": "stop"},
+        ]
+    )
+
+    def worker(command, **kwargs):
+        job = read_json(command[-1])
+        if job["kind"] == "diagnostic":
+            save_json(Path(job["folder"]) / "result.json", {"marker": "diagnostic evidence"})
+            return
+        checkpoint = Path(job["folder"]) / "weights" / "best.pt"
+        checkpoint.parent.mkdir(parents=True, exist_ok=True)
+        checkpoint.write_bytes(b"trained weights")
+        metrics = good_metrics(checkpoint)
+        metrics["training"] = {"stop_reason": "time_budget"}
+        save_json(Path(job["folder"]) / "metrics.json", metrics)
+
+    result = run_autonomous(campaign, agent=agent, executor=worker)
+    assert result["status"] == "stopped"
+    trials = read_json(campaign.output_dir / "state.json")["trials"]
+    assert [r["recipe"]["id"] for r in trials] == ["baseline", "continued"]
+
+
+def test_evidence_signals_surface_plateau_and_generalization_gap(campaign):
+    enable(campaign)
+    version = freeze_dataset(campaign)["version"]
+    seeded = campaign.output_dir / "diagnostics" / "seeded"
+    seeded.mkdir(parents=True)
+    save_json(seeded / "provenance.json", {"dataset_version": version, "trial_id": "trial-0001"})
+    save_json(
+        seeded / "outcome.json",
+        {
+            "kind": "evaluate_train_full",
+            "status": "completed",
+            "evidence": {"ball": {"ap50": 0.9}, "validation_ball": {"ap50": 0.5}},
+        },
+    )
+    recipe = campaign.recipes[0].model_dump()
+    agent = ScriptedAgent(
+        [
+            {"action": "train", "recipe": recipe},
+            {"action": "train", "recipe": {**recipe, "id": "res-672", "imgsz": 672}},
+            {"action": "train", "recipe": {**recipe, "id": "res-704", "imgsz": 704}},
+            {"action": "stop"},
+        ]
+    )
+    result = run_autonomous(campaign, agent=agent, executor=warm_start_worker)
+    assert result["status"] == "stopped"
+    signals = agent.evidence[-1]["signals"]
+    assert signals["completed_trials_on_version"] == 3
+    assert signals["best_current"]["trial_id"] == "trial-0001"
+    assert signals["ball_ap50_span_on_version"] == [0.96, 0.96]
+    assert "plateau" in signals and "repeated_settings" not in signals
+    assert signals["train_validation_gap"]["gap"] == pytest.approx(0.4)
+    assert "generalization_limited" in signals
+    assert any(m.endswith(".pt") for m in agent.evidence[-1]["available_models"])
 
 
 @pytest.mark.integration

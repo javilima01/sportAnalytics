@@ -13,7 +13,7 @@ from .allowances import (
     effective_campaign,
     trial_minutes,
 )
-from .config import Recipe, Settings
+from .config import Recipe, Settings, base_models
 from .controller import (
     freeze_dataset,
     load_state,
@@ -70,7 +70,17 @@ class ResearchDecision(Settings):
 
 
 def recipe_key(recipe):
-    return value_hash({k: v for k, v in recipe.items() if k not in ("id", "hypothesis")})
+    # Normalize through Recipe so records from older schema versions compare equal.
+    normalized = Recipe.model_validate(recipe).model_dump()
+    return value_hash({k: v for k, v in normalized.items() if k not in ("id", "hypothesis")})
+
+
+def settings_key(recipe):
+    """Hyperparameters only: ignoring identity and the starting checkpoint."""
+    normalized = Recipe.model_validate(recipe).model_dump()
+    return value_hash(
+        {k: v for k, v in normalized.items() if k not in ("id", "hypothesis", "model")}
+    )
 
 
 def can_train(cfg, state, minutes=None):
@@ -122,6 +132,69 @@ def trial_context(record):
     }
 
 
+def experiment_signals(state, snapshot, diagnostics):
+    """Deterministic findings computed for the agent instead of left to derivation."""
+    current = [
+        r
+        for r in state["trials"]
+        if r["phase"] == "explore"
+        and r["status"] == "completed"
+        and r.get("dataset_version") == snapshot["version"]
+    ]
+    signals = {"completed_trials_on_version": len(current)}
+    if not current:
+        return signals
+    best = min(current, key=rank)
+    signals["best_current"] = {
+        "trial_id": best["id"],
+        "ball": best["metrics"]["ball"],
+        "macro": best["metrics"]["macro"],
+    }
+    aps = [r["metrics"]["ball"]["ap50"] for r in current]
+    signals["ball_ap50_span_on_version"] = [min(aps), max(aps)]
+    if len(current) >= 3 and max(aps) - min(aps) < 0.05:
+        signals["plateau"] = (
+            f"{len(current)} completed trials span ball AP50 {min(aps):.3f}-{max(aps):.3f} on "
+            "this dataset version; differences are within small-validation noise. Change data, "
+            "augmentation, architecture or regularization rather than repeating optimization."
+        )
+    families = {}
+    for r in current:
+        families.setdefault(settings_key(r["recipe"]), []).append(r["id"])
+    repeated = [sorted(ids) for ids in families.values() if len(ids) > 1]
+    if repeated:
+        signals["repeated_settings"] = [
+            {"trials": ids, "note": "Identical hyperparameters, ignoring the starting checkpoint."}
+            for ids in sorted(repeated)
+        ]
+    for entry in reversed(diagnostics):
+        if entry.get("kind") != "evaluate_train_full" or entry.get("status") != "completed":
+            continue
+        if entry.get("dataset_version") != snapshot["version"]:
+            continue
+        findings = entry.get("evidence", {})
+        train_ap = findings.get("ball", {}).get("ap50")
+        val_ap = findings.get("validation_ball", {}).get("ap50")
+        if train_ap is None or val_ap is None:
+            continue
+        gap = round(train_ap - val_ap, 4)
+        signals["train_validation_gap"] = {
+            "diagnostic": entry["id"],
+            "trial_id": entry.get("trial_id"),
+            "train_ball_ap50": train_ap,
+            "validation_ball_ap50": val_ap,
+            "gap": gap,
+        }
+        if gap > 0.15:
+            signals["generalization_limited"] = (
+                f"Training fit exceeds validation by {gap:.2f} ball AP50; more optimization "
+                "cannot close this gap. Prioritize data diversity, augmentation, regularization "
+                "or architecture over further warm-started training."
+            )
+        break
+    return signals
+
+
 def evidence(cfg, workflow, state, snapshot, base_cfg=None):
     history = []
     for r in state["trials"]:
@@ -169,6 +242,8 @@ def evidence(cfg, workflow, state, snapshot, base_cfg=None):
         "objective": "Smallest student passing every macro AND ball gate",
         "thresholds": cfg.evaluation.thresholds,
         "available_recipes": [r.model_dump() for r in cfg.recipes],
+        "available_models": sorted(base_models(cfg)),
+        "signals": experiment_signals(state, snapshot, diagnostics),
         "dataset_version": snapshot["version"],
         "benchmark_version": snapshot.get("benchmark_version"),
         "counts": {s: snapshot["counts"][s] for s in ("train", "val")},
@@ -214,11 +289,17 @@ def choose_action(cfg, agent, folder, payload, images):
     prompt = (
         "You direct football detection research. Choose the NEXT action from evidence, not a fixed queue. "
         "Return the structured decision. Do not execute tools or edit files; the controller executes your action. "
-        "train: propose a complete recipe, including existing presets or changed resolution, augmentation, "
-        "learning rate, optimizer, batch or epochs. Use only configured starting model paths and a unique id. "
-        "Set minutes to request a longer or shorter training run within the time ceiling. You may also choose a "
-        "registered warm_start_models checkpoint as recipe.model to continue learning from previous weights "
-        "with a fresh optimizer/schedule. Repeating identical settings needs a different time allowance or dataset. "
+        "train: propose a complete recipe. Beyond resolution, batch, epochs and optimizer you control "
+        "augmentation (mosaic, close_mosaic, mixup, copy_paste, erasing, hsv_h, hsv_s, hsv_v, degrees, "
+        "translate, scale, shear, perspective, fliplr, flipud) and optimization (lr0, lrf, weight_decay, "
+        "warmup_epochs, patience, dropout). For tiny objects, erasing deletes labeled pixels and scale "
+        "shrinks them; consider lowering both. recipe.model may be any path in available_models (including "
+        "architecture YAMLs for fresh capacity/head variants) or a registered warm_start_models checkpoint "
+        "to continue learning from previous weights with a fresh optimizer/schedule. Use a unique id. "
+        "Warm-starting settings identical to a completed trial on the current dataset version is rejected "
+        "unless every such trial stopped on the time budget. When the signals show a generalization gap or "
+        "plateau, change data, augmentation, regularization or architecture; do not repeat optimization. "
+        "Set minutes to request a longer or shorter training run within the time ceiling. "
         "Prior-campaign trials are historical context, not acceptance evidence under the new code/data. "
         "Use their lessons and warm-start checkpoints instead of blindly repeating their failed baselines. "
         "Later-phase failures are returned to you for corrective experiments or budget adjustments. "
@@ -422,16 +503,22 @@ def explore_adaptively(
                     if not can_train(cfg, state, minutes):
                         raise ValueError("No exploration trial budget remains.")
                     recipe = decision.recipe
-                    allowed_models = {r.model for r in cfg.recipes}
-                    if cfg.autonomy.enabled:
-                        for prior in [*state["trials"], *prior_trials(cfg)]:
-                            if (
-                                prior["status"] == "completed"
-                                and recipe.model == prior["metrics"]["checkpoint"]
-                            ):
-                                if file_hash(recipe.model) != prior["metrics"]["checkpoint_sha256"]:
-                                    raise ValueError("Warm-start checkpoint changed.")
-                                allowed_models.add(recipe.model)
+                    allowed_models = base_models(cfg)
+                    warm_starts = {
+                        r["metrics"]["checkpoint"]
+                        for r in [*state["trials"], *prior_trials(cfg)]
+                        if r["status"] == "completed"
+                    }
+                    if cfg.autonomy.enabled and recipe.model in warm_starts:
+                        prior = next(
+                            r
+                            for r in [*state["trials"], *prior_trials(cfg)]
+                            if r["status"] == "completed"
+                            and recipe.model == r["metrics"]["checkpoint"]
+                        )
+                        if file_hash(recipe.model) != prior["metrics"]["checkpoint_sha256"]:
+                            raise ValueError("Warm-start checkpoint changed.")
+                        allowed_models.add(recipe.model)
                     if recipe.model not in allowed_models:
                         raise ValueError(
                             "Recipe checkpoint must be from the configured search space."
@@ -447,6 +534,25 @@ def explore_adaptively(
                         ):
                             raise ValueError(
                                 "These recipe settings were already attempted on this dataset version."
+                            )
+                    if recipe.model in warm_starts:
+                        repeats = [
+                            t
+                            for t in state["trials"]
+                            if t["status"] == "completed"
+                            and t.get("dataset_version") == snapshot["version"]
+                            and settings_key(t["recipe"]) == settings_key(recipe.model_dump())
+                        ]
+                        if repeats and not all(
+                            t.get("metrics", {}).get("training", {}).get("stop_reason")
+                            == "time_budget"
+                            for t in repeats
+                        ):
+                            raise ValueError(
+                                "Warm-start repeats the converged settings of "
+                                + ", ".join(t["id"] for t in repeats)
+                                + " on this dataset version; change hyperparameters, "
+                                "augmentation or data instead of repeating optimization."
                             )
                     save_json(folder / "effect.json", {"first_trial_index": len(state["trials"])})
                     updated = run_campaign(

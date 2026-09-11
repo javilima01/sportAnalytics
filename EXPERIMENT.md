@@ -346,9 +346,13 @@ a pilot with few unique frames is not a deployment benchmark.
 
 ## Search space and records
 
-Codex proposes validated recipe fields: starting checkpoint, image size, batch,
-epochs, learning rate, optimizer, mosaic, scale and rotation. Proposals may use
-only checkpoint paths in the original recipe list. Defaults compare YOLOv8n at
+Codex proposes validated recipe fields: starting checkpoint or architecture YAML,
+image size, batch, epochs, learning rate and final-LR factor, optimizer, weight decay,
+warmup, early-stopping patience, dropout, and the augmentation set (mosaic,
+close_mosaic, mixup, copy_paste, erasing, hsv_h/hsv_s/hsv_v, degrees, translate,
+scale, shear, perspective, fliplr, flipud). Proposals may use checkpoint/architecture
+paths in the original recipe list or other `.pt`/`.yaml` files in the same model
+directories. Defaults compare YOLOv8n at
 640 and 960, plus YOLOv8s/m/l/x at 640. In adaptive mode these are starting suggestions,
 not a queue the agent must exhaust. It may adjust a small student's resolution or
 augmentation before trying larger models. The default eight-trial exploration
@@ -360,7 +364,13 @@ allows a larger feasible model to outrank a smaller feasible one. This finds the
 smallest passing model tested in the configured search space and budget, not a
 proof that no smaller architecture or longer-trained candidate could work.
 `proposals: queue` runs only configured recipes; annotation still uses Codex.
-Arbitrary architecture/code mutation is outside this controller's current scope.
+Architecture mutation is limited to existing model files in the configured model
+directories (for example a P2 small-object YOLOv8 variant); arbitrary code changes
+remain outside this controller's scope. Registered warm-start checkpoints may be
+reused, but warm-starting settings identical to a completed trial on the current
+dataset version is rejected unless every such trial stopped on its time budget —
+converged settings must change hyperparameters, augmentation or data, not just
+the optimizer state.
 
 Code, relevant dependency versions, initial checkpoint hashes, campaign settings
 and the validation/test benchmark must remain fixed. Training additions require

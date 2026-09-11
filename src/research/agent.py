@@ -9,7 +9,7 @@ from typing import Literal
 from pydantic import Field, model_validator
 
 from ..dataset import atomic_write
-from .config import Recipe, Settings, Source
+from .config import Recipe, Settings, Source, base_models
 from .providers import (
     ProvidersUnavailable,
     QuotaExceeded,
@@ -148,19 +148,25 @@ class CodexAgent:
             "extra accuracy does not justify a larger passing model. Use the trial evidence "
             "to improve smaller students where promising. The annotation teacher is independent "
             "of the student and does not determine the deployment model size. "
-            "Change one major variable and explain the hypothesis. Use only model checkpoint "
-            "paths present in the supplied recipes; choose a new unique id. Short trials are "
-            "comparisons at fixed time, not claims of fully trained accuracy.\n"
+            "You control augmentation (mosaic, close_mosaic, mixup, copy_paste, erasing, hsv_h, "
+            "hsv_s, hsv_v, degrees, translate, scale, shear, perspective, fliplr, flipud) and "
+            "optimization (lr0, lrf, weight_decay, warmup_epochs, patience, dropout) as well as "
+            "resolution, batch and epochs. For tiny objects, erasing deletes labeled pixels and "
+            "scale shrinks them; consider lowering both. "
+            "Change one major variable and explain the hypothesis. Use only model paths listed in "
+            "available_models (checkpoints or architecture YAMLs); choose a new unique id. "
+            "Short trials are comparisons at fixed time, not claims of fully trained accuracy.\n"
             + json.dumps(
                 {
                     "available_recipes": [r.model_dump() for r in self.cfg.recipes],
+                    "available_models": sorted(base_models(self.cfg)),
                     "thresholds": self.cfg.evaluation.thresholds,
                     "history": history,
                 }
             )
         )
         recipe = self.request(prompt, Recipe, directory)
-        if recipe.model not in {r.model for r in self.cfg.recipes}:
+        if recipe.model not in base_models(self.cfg):
             raise ValueError("Agent proposed a checkpoint outside the configured search space.")
         return recipe
 
