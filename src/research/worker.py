@@ -11,6 +11,7 @@ from pathlib import Path
 
 from ultralytics import YOLO
 
+from ..precision import enable_mixed_precision, resolve_device
 from .config import Campaign, Recipe
 from .evaluation import evaluate, localization_report
 from .progress import TrainingProgress
@@ -32,9 +33,11 @@ def train_job(job):
     progress = TrainingProgress(folder, training_seconds, cfg.evaluation.ball_class_id)
     progress.write(
         f"starting {recipe.id} ({recipe.model}), device={cfg.device}, "
-        f"imgsz={recipe.imgsz}, seed={job['seed']}, "
+        f"precision={cfg.precision}, imgsz={recipe.imgsz}, seed={job['seed']}, "
         f"up to {recipe.epochs} epochs / {training_seconds / 60:.1f} min training"
     )
+    if cfg.precision != "fp32":
+        enable_mixed_precision(model, cfg.precision, resolve_device(cfg.device))
     progress.attach(model)
     timed_out = False
 
@@ -80,7 +83,7 @@ def train_job(job):
     parameters = sum(p.numel() for p in best.model.parameters())
     progress.write("training finished; evaluating best.pt on validation images")
     metrics, frames = evaluate(
-        best, cfg.dataset_dir, "val", cfg.evaluation, cfg.device, recipe.imgsz
+        best, cfg.dataset_dir, "val", cfg.evaluation, cfg.device, recipe.imgsz, half=cfg.half
     )
     metrics.update(
         localization=localization_report(frames, cfg.evaluation.ball_class_id),
@@ -89,6 +92,8 @@ def train_job(job):
         checkpoint=str(checkpoint),
         checkpoint_sha256=file_hash(checkpoint),
         seed=job["seed"],
+        precision=cfg.precision,
+        half=cfg.half,
         epochs_completed=model.trainer.epoch + 1,
         runtime_seconds=time.monotonic() - start,
         training={
@@ -126,6 +131,7 @@ def test_job(job):
         cfg.device,
         job["imgsz"],
         confidence=job["confidence"],
+        half=cfg.half,
     )
     save_json(Path(job["folder"]) / "predictions.json", frames)
     save_json(Path(job["folder"]) / "metrics.json", metrics)
@@ -145,16 +151,15 @@ def main():
     if os.getpgrp() == os.getpid():
         threading.Thread(target=monitor_parent, daemon=True).start()
     job = read_json(sys.argv[1])
-    save_json(
-        Path(job["folder"]) / "environment.json",
-        {
-            "platform": platform.platform(),
-            "python": sys.version,
-            "packages": {
-                name: version(name) for name in ("torch", "ultralytics", "numpy", "pydantic")
-            },
-        },
-    )
+    environment = {
+        "platform": platform.platform(),
+        "python": sys.version,
+        "packages": {name: version(name) for name in ("torch", "ultralytics", "numpy", "pydantic")},
+    }
+    if "campaign" in job:
+        campaign = Campaign.model_validate(job["campaign"])
+        environment.update(precision=campaign.precision, half=campaign.half)
+    save_json(Path(job["folder"]) / "environment.json", environment)
     if job["kind"] == "diagnostic":
         from .diagnostics import diagnostic_job
 

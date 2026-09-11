@@ -1,0 +1,237 @@
+# Run: python main.py research init
+# Starts/resumes acquisition, automatic labeling, experiments, and final evaluation.
+# Settings are frozen when the campaign is initialized. Comments can be edited freely;
+# Changing user settings afterward requires a new campaign; agent budget changes use a separate journal.
+# The agent writes decisions and results to output_dir; it does not rewrite this YAML.
+# Relative paths below resolve from the directory containing this file.
+
+# Name identifying this research campaign.
+campaign_id: football-fp16
+# Stores campaign state, trials, checkpoints, logs, and dataset-version records.
+output_dir: experiments/football-fp16
+# Use the previous run as evidence and permit warm starts; old scores are not new acceptance evidence.
+prior_campaign: experiments/football-m5
+# Images, labels, manifest, and data.yaml used by this campaign.
+# This directory was already seeded with existing labels; changing its name does
+# not automatically copy a dataset. Repeated runs reuse the configured directory.
+dataset_dir: datasets/football-astra-high
+# Use the Mac's Apple GPU through PyTorch MPS for detection/training.
+device: mps
+# Training compute precision; fp16/bf16 use MPS autocast with fp32 losses.
+# fp16 is faster but can skip unstable steps (loss scaling); bf16 is the safer option.
+precision: fp16
+# Inference precision for teacher labeling, evaluation, benchmarks, and the final test.
+half: true
+# Number of data-loader subprocesses; this is not the number of research agents.
+workers: 4
+# CLI command (or full executable path) used to launch the primary research agent.
+codex_executable: codex
+# Model explicitly passed to the Codex CLI for research/annotation requests.
+codex_model: gpt-6-astra
+# Reasoning setting passed to Codex; medium is an alternative for lighter reasoning.
+# This controls the agent, not the YOLO student's training compute.
+codex_reasoning_effort: high
+
+# Provider switching when an agent request hits an explicit usage/quota limit.
+fallback:
+  # Permit switching from Codex to OpenCode; unrelated errors do not trigger fallback.
+  enabled: true
+  # OpenCode CLI command, also accepting a full executable path.
+  executable: opencode
+  # Exact fallback model identifier; the runner checks its free/image capabilities.
+  model: opencode-go/deepseek-v4.1-flash
+  # Retry Codex after its quota cooldown, normally 5 minutes, at a request boundary.
+  # A reported earlier reset can shorten the cooldown; requests aren't interrupted.
+  codex_retry_seconds: 300
+  # Equivalent quota cooldown for OpenCode, normally 1 minute.
+  opencode_retry_seconds: 60
+  # Maximum accumulated provider-wait time when no configured provider is available.
+  max_wait_hours: 24
+# With diagnostics enabled, the agent chooses each next action/recipe from the start.
+# 'queue' would restrict experiment proposals to the configured recipes.
+# The provider router still decides whether a request uses Codex or OpenCode.
+proposals: codex
+# YOLO class order: class 0 = player, class 1 = ball. Preserve existing label IDs.
+names: [player, ball]
+
+# Initial video discovery, frame extraction, and automatic annotation settings.
+acquisition:
+  # Initial YouTube searches; later data-growth rounds can propose targeted queries.
+  queries: ["football full match wide camera", "football full match wide camera snow conditions", "football full match wide camera rain conditions"]
+  # Empty means discover videos automatically. Explicit source plans can be supplied.
+  # Saved source plans are reused when resuming acquisition.
+  sources: []
+  # Initial source-plan limit. Known video/match identities are recovered from the existing dataset.
+  # Later growth can add sources under its separate rounds/sources-per-round limits.
+  max_sources: 24
+  # Maximum sampled candidate frames per source clip; rejected frames aren't accepted labels.
+  max_frames_per_source: 30
+  # Time allowance per acquisition/growth round, including discovery and labeling.
+  minutes: 30
+  # Initial acquisition attempts to obtain a dataset with valid train/val/test coverage.
+  # Separate from data_growth.max_rounds below; budgets can stop acquisition earlier.
+  max_rounds: 3
+  # Cumulative download allowance in decimal GB, shared across acquisition/growth rounds.
+  # Accounting uses downloaded file sizes, not exact network traffic.
+  download_gb: 10
+  # Maximum size of dataset_dir, including staging files, in decimal GB.
+  # Experiment checkpoints in output_dir are outside this storage limit.
+  storage_gb: 20
+  # YOLOv8 extra-large proposes annotation boxes, which the agent reviews/corrects.
+  # This teacher is independent of the smaller student models being compared.
+  teacher: models/yolov8x.pt
+  # Teacher inference image-size setting in pixels; larger inputs help retain small detail.
+  # This does not set the student training resolution or resize the stored originals.
+  teacher_imgsz: 1280
+
+# Collect frames for any authorized split or review existing labels during exploration.
+data_growth:
+  # Enable the automatic search -> label -> append training data -> experiment loop.
+  enabled: true
+  # Minimum accepted training images required before running experiments.
+  # This is a starting minimum, not a target dataset size or accuracy guarantee.
+  min_train_images: 120
+  # Maximum additional collection rounds, including any needed to reach the minimum.
+  # This is the initial allowance; the agent can raise it within autonomy.max_data_rounds.
+  max_rounds: 10
+  # Up to three new video sources per growth round; existing matches are excluded.
+  sources_per_round: 3
+  # Batch size for the older automatic growth loop when diagnostics are disabled.
+  # The adaptive agent instead decides after each completed action/trial.
+  trials_per_round: 2
+
+# Agent-directed diagnostics and decisions (requires proposals: codex).
+# Starts with a data inspection; the agent then chooses training, another check,
+# targeted collection, promotion, or stopping. Decisions are saved in output_dir/decisions.
+diagnostics:
+  enabled: true  # false restores the preset-queue/batched-growth workflow.
+  max_actions: 12  # Total diagnostic attempts, including the initial data inspection.
+  minutes: 5  # Maximum minutes per diagnostic worker, including its evaluation.
+  max_minutes: 30  # Cumulative diagnostic runtime; also counts toward budget.max_hours.
+  max_images: 16  # Maximum images per sampled transform/fit check and per crop-fit dataset.
+  max_decisions: 32  # Caps agent decisions, including rejected actions; prevents endless loops.
+# Diagnostics never count as candidate trials or access the held-out test images.
+# Crop overfitting deliberately scores training crops; its scores do not prove accuracy.
+
+# Agent-owned working allowances can grow up to these user-owned ceilings.
+# Every increase is saved in output_dir/budget_changes.json; this YAML stays unchanged.
+# Normal exploration still starts at budget.exploration_minutes below.
+autonomy:
+  enabled: true  # Permit justified budget increases and warm starts from saved trials.
+  allow_benchmark_growth: true  # Collect new independent matches for val/test as well as train.
+  allow_label_review: true  # Recheck original images automatically and version label corrections.
+  max_trial_minutes: 240  # Up to four hours for an individual training action when justified.
+  max_hours: 72  # Ceiling on cumulative trial + diagnostic compute for this campaign.
+  max_trials: 80  # Ceiling on all training attempts, including failed attempts.
+  max_exploration_trials: 60  # Leaves room for promotion and confirmation within max_trials.
+  max_data_rounds: 30  # Collection and label-review rounds share this allowance.
+  max_acquisition_minutes: 60  # Maximum active time per collection/review round.
+  max_download_gb: 50  # Maximum cumulative downloaded file size for this campaign.
+  max_storage_gb: 100  # Dataset storage ceiling; training artifacts have separate disk use.
+  max_diagnostic_actions: 50  # Maximum diagnostic attempts.
+  max_diagnostic_minutes: 15  # Maximum time for one diagnostic, including full-training evaluation.
+  max_diagnostic_total_minutes: 120  # Cumulative diagnostic time; also counted in max_hours.
+  max_decisions: 200  # Includes rejected actions; limits unproductive decision loops.
+# Test collection/review exposes pixels only to the annotation call, not student test results.
+# All benchmark changes require fresh current-version results before model promotion.
+
+# Quality gates used to select a model and accept final results against agent-made labels.
+evaluation:
+  # Every score must be STRICTLY GREATER than its threshold, both for the average
+  # across classes (macro) and for the ball class alone. One failed gate means failure.
+  thresholds:
+    # Average precision averaged over box-overlap (IoU) thresholds 0.50 through 0.95.
+    ap50_95: 0.70
+    # Average precision at IoU 0.50; AP summarizes precision/recall across confidence levels.
+    ap50: 0.85
+    # Fraction of predicted detections that are correct, at the selected confidence threshold.
+    precision: 0.90
+    # Fraction of labeled objects successfully detected, at that confidence threshold.
+    recall: 0.90
+    # Harmonic mean of precision and recall: 2 * precision * recall / (precision + recall).
+    f1: 0.85
+
+# Initial working allowances; the agent may raise them within the autonomy ceilings above.
+# Each trial's deadline includes training and evaluation; by default 120 seconds
+# are reserved for evaluation (capped at 40% of the trial deadline).
+budget:
+  # Default minutes per exploration trial; startup/evaluation reserve reduces training time.
+  exploration_minutes: 30
+  # Maximum minutes to rerun the selected candidate in the promotion stage.
+  promotion_minutes: 30
+  # Maximum minutes PER confirmation run; confirmation uses three seeds: 0, 1, 2.
+  confirmation_minutes: 120
+  # Maximum training epochs per confirmation run; the time ceiling also applies.
+  confirmation_epochs: 200
+  # Maximum exploration attempts across all recipes, dataset versions, and growth rounds.
+  # With two trials per batch, eight attempts permit at most four full trial batches.
+  max_exploration_trials: 8
+  # Maximum total training attempts across explore/promote/confirm, including failed attempts.
+  # The separate final-test evaluation does not consume a training-trial slot.
+  max_trials: 20
+  # Total accounted trial + diagnostic runtime. Interrupted work is charged its reserved limit.
+  # Acquisition and provider waits have separate limits; this is not total wall-clock time.
+  max_hours: 20
+  # Deadline for the one final held-out test evaluation after all confirmation seeds pass.
+  final_test_minutes: 30
+
+# Initial student recipes. Among models passing every gate, fewer parameters win.
+# In adaptive mode these define allowed checkpoints and starting suggestions, not a fixed queue.
+# The agent may adjust their settings immediately; it need not try every model size.
+# Shared defaults omitted below: batch=4, epochs=100, lr0=0.001, optimizer=AdamW,
+# mosaic=0.5, scale=0.5, degrees=0. Confirmation overrides epochs with its own limit.
+recipes:
+  # Unique recipe ID used in experiment records.
+  - id: nano640
+    # Human-readable reason for testing this recipe; does not change training itself.
+    hypothesis: Establish a small-model baseline.
+    # Starting YOLOv8 nano checkpoint; each trial starts from its configured checkpoint.
+    model: models/yolov8n.pt
+    # Student training/evaluation image-size setting in pixels (not stored-image dimensions).
+    imgsz: 640
+    batch: 8
+  # Second recipe: same small architecture, with a larger input image size.
+  - id: nano960
+    # Test whether additional image detail improves detection of small balls.
+    hypothesis: Higher resolution improves ball recall.
+    # Same nano starting checkpoint, allowing resolution to be compared.
+    model: models/yolov8n.pt
+    # Higher resolution generally requires more compute and memory than 640.
+    imgsz: 960
+    batch: 8
+  # Third recipe: YOLOv8 small.
+  - id: s640
+    # Test whether the small architecture passes the same unchanged gates.
+    hypothesis: Measure whether YOLOv8s meets the fixed quality gates.
+    # Small student starting checkpoint.
+    model: models/yolov8s.pt
+    # Student input image-size setting.
+    imgsz: 640
+    batch: 8
+  # Fourth recipe: YOLOv8 medium.
+  - id: m640
+    # Test whether the medium architecture passes the same unchanged gates.
+    hypothesis: Measure whether YOLOv8m meets the fixed quality gates.
+    # Medium student starting checkpoint.
+    model: models/yolov8m.pt
+    # Student input image-size setting.
+    imgsz: 640
+    batch: 8
+  # Fifth recipe: YOLOv8 large.
+  - id: l640
+    # Test whether the large architecture passes the same unchanged gates.
+    hypothesis: Measure whether YOLOv8l meets the fixed quality gates.
+    # Large student starting checkpoint.
+    model: models/yolov8l.pt
+    # Student input image-size setting.
+    imgsz: 640
+    batch: 8
+  # Sixth recipe: YOLOv8 extra-large, still subject to the preference for smaller passing models.
+  - id: x640
+    # Test whether the extra-large architecture passes the same unchanged gates.
+    hypothesis: Measure whether YOLOv8x meets the fixed quality gates.
+    # Extra-large student starting checkpoint; this trial is separate from teacher inference.
+    model: models/yolov8x.pt
+    # Student input image-size setting; the teacher separately uses 1280.
+    imgsz: 640
+    batch: 8

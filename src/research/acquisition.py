@@ -218,6 +218,7 @@ def extract_source(job):
                 imgsz=cfg.acquisition.teacher_imgsz,
                 conf=0.1,
                 device=cfg.device,
+                half=cfg.half,
                 verbose=False,
             )[0]
             proposals = [

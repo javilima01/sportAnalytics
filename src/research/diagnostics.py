@@ -399,6 +399,7 @@ def diagnostic_job(job):
             cfg.device,
             trial["recipe"]["imgsz"],
             image_paths=paths,
+            half=cfg.half,
         )
         total = sum(
             json.loads(line)["split"] == "train"

@@ -30,6 +30,7 @@ class DatasetCreator:
         device=None,
         seed=0,
         include_empty=False,
+        half=False,
     ):
         if not math.isfinite(sample_prob) or not 0 <= sample_prob <= 1:
             raise ValueError("sample_prob must be between 0 and 1.")
@@ -49,6 +50,7 @@ class DatasetCreator:
         self.output_dir = Path(output_dir)
         self.sample_prob, self.splits, self.imgsz = sample_prob, splits, imgsz
         self.conf, self.device, self.include_empty = conf, device, include_empty
+        self.half = half
         self.random = random.Random(seed)
         self.model = YOLO(str(model_path))
         if self.model.task != "detect":
@@ -178,7 +180,12 @@ class DatasetCreator:
                     ):
                         continue
                     result = self.model.predict(
-                        frame, imgsz=self.imgsz, conf=self.conf, device=self.device, verbose=False
+                        frame,
+                        imgsz=self.imgsz,
+                        conf=self.conf,
+                        device=self.device,
+                        half=self.half,
+                        verbose=False,
                     )[0]
                     if result.boxes is None:
                         raise ValueError("Model did not return detection boxes.")

@@ -50,6 +50,12 @@ def parse_args(argv=None):
     train_parser.add_argument("--seed", default=0, type=int, help="Training random seed")
     train_parser.add_argument("--patience", default=100, type=int, help="Early stopping patience")
     train_parser.add_argument("--workers", default=8, type=int, help="Number of dataloader workers")
+    train_parser.add_argument(
+        "--precision",
+        default="fp32",
+        choices=("fp32", "fp16", "bf16"),
+        help="Training compute precision; fp16/bf16 use mixed precision on MPS or CUDA",
+    )
 
     # --- GENERATE DATASET ---
     gen_parser = subparsers.add_parser(
@@ -86,6 +92,9 @@ def parse_args(argv=None):
         "--include_empty",
         action="store_true",
         help="Keep frames without detections for manual tagging or background examples",
+    )
+    gen_parser.add_argument(
+        "--half", action="store_true", help="Run inference in fp16 (MPS or CUDA)"
     )
     gen_parser.add_argument(
         "--segments",
@@ -132,6 +141,9 @@ def parse_args(argv=None):
         default=None,
         help="Device ('cpu', 'mps', or CUDA index); auto-select by default",
     )
+    vis_parser.add_argument(
+        "--half", action="store_true", help="Run inference in fp16 (MPS or CUDA)"
+    )
     vis_parser.add_argument("--edit", action="store_true", help="Open interactive label editor")
 
     # --- VALIDATE ---
@@ -165,6 +177,9 @@ def parse_args(argv=None):
         help="Device ('cpu', 'mps', or CUDA index); auto-select by default",
     )
     val_parser.add_argument("--workers", default=8, type=int, help="Number of dataloader workers")
+    val_parser.add_argument(
+        "--half", action="store_true", help="Run validation in fp16 (MPS or CUDA)"
+    )
 
     research = subparsers.add_parser(
         "research", help="Acquire agent-labeled data and run experiments"
@@ -306,6 +321,7 @@ def run_validate(args):
             batch=args.batch,
             device=args.device,
             workers=args.workers,
+            half=args.half,
         )
         trainer = YOLOFineTuner(cfg)
         try:
@@ -380,6 +396,7 @@ def run_train(args):
         device=args.device,
         workers=args.workers,
         seed=args.seed,
+        precision=args.precision,
     )
 
     trainer = YOLOFineTuner(cfg)
@@ -413,6 +430,7 @@ def run_generate(args):
         device=args.device,
         seed=args.seed,
         include_empty=args.include_empty,
+        half=args.half,
     )
 
     creator.create_from_video(args.video, segments=args.segments)
@@ -431,6 +449,7 @@ def run_visualize(args):
         conf=args.conf,
         imgsz=args.imgsz,
         device=args.device,
+        half=args.half,
         window_name="YOLO Predictions" if args.model else "YOLO Label Editor",
     )
 

@@ -175,7 +175,9 @@ def acceptance(metrics, cfg):
     return {"feasible": not failures, "failures": failures, "progress": min(ratios)}
 
 
-def evaluate(model, dataset, split, cfg, device, imgsz, confidence=None, *, image_paths=None):
+def evaluate(
+    model, dataset, split, cfg, device, imgsz, confidence=None, *, image_paths=None, half=False
+):
     names = read_names(Path(dataset) / "data.yaml")
     if model.names != names:
         raise ValueError("Model classes differ from the evaluation taxonomy.")
@@ -208,6 +210,7 @@ def evaluate(model, dataset, split, cfg, device, imgsz, confidence=None, *, imag
             agnostic_nms=False,
             augment=False,
             device=device,
+            half=half,
             verbose=False,
         )[0]
         boxes = results.boxes
@@ -241,6 +244,7 @@ def evaluate(model, dataset, split, cfg, device, imgsz, confidence=None, *, imag
                 iou=cfg.nms_iou,
                 max_det=cfg.max_det,
                 device=device,
+                half=half,
                 verbose=False,
             )
             if device == "mps":

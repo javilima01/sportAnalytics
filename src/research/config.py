@@ -171,6 +171,11 @@ class Campaign(Settings):
     dataset_dir: Path = Path("datasets/football-pilot")
     device: str = "mps"
     workers: int = Field(2, ge=0)
+    # Training compute precision. fp32 is the default; fp16/bf16 use autocast via
+    # src/precision.py (Ultralytics gates AMP to CUDA). bf16 needs no loss scaling.
+    precision: Literal["fp32", "fp16", "bf16"] = "fp32"
+    # Inference precision for teacher labeling, evaluation, and benchmarks.
+    half: bool = False
     names: list[str] = Field(default_factory=lambda: ["player", "ball"], min_length=2)
     taxonomy: str = (
         "Player includes active outfield players and goalkeepers. Exclude referees, "

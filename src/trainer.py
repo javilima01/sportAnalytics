@@ -7,6 +7,7 @@ from ultralytics import YOLO
 
 from .config import setup_logger
 from .models import TrainConfig
+from .precision import enable_mixed_precision, resolve_device
 
 
 class YOLOFineTuner:
@@ -21,7 +22,13 @@ class YOLOFineTuner:
         self.writer = None
 
     def train(self):
-        results = self.model.train(**self.cfg.training_args())
+        arguments = self.cfg.training_args()
+        if self.cfg.precision != "fp32":
+            device = resolve_device(self.cfg.device)
+            arguments["device"] = str(device)
+            self.logger.info("Training precision %s on %s", self.cfg.precision, device)
+            enable_mixed_precision(self.model, self.cfg.precision, device)
+        results = self.model.train(**arguments)
         directory = Path(self.model.trainer.save_dir)
         if self.writer is not None:
             self.writer.close()
@@ -32,14 +39,22 @@ class YOLOFineTuner:
         self.logger.info("Training completed: %s", directory)
         return results
 
-    def validate(self, split="val"):
+    def validate(self, split="val", half=None):
+        half = self.cfg.half if half is None else half
+        device = self.cfg.device
+        if half:
+            resolved = resolve_device(device)
+            if resolved.type == "cpu":
+                raise ValueError("Half-precision validation requires an MPS or CUDA device.")
+            device = str(resolved)
         metrics = self.model.val(
             data=self.cfg.data,
             imgsz=self.cfg.imgsz,
-            device=self.cfg.device,
+            device=device,
             batch=self.cfg.batch,
             workers=self.cfg.workers,
             split=split,
+            half=half,
         )
         self._log_metrics(split, metrics)
         return metrics

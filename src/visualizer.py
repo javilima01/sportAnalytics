@@ -24,6 +24,7 @@ class Visualizer:
         conf=0.25,
         imgsz=1280,
         device=None,
+        half=False,
     ):
         if max_images < 1:
             raise ValueError("max_images must be positive.")
@@ -46,6 +47,7 @@ class Visualizer:
                 raise ValueError("Prediction preview requires a detection model.")
             self.prediction_names = class_names(self.model.names)
         self.conf, self.imgsz, self.device = conf, imgsz, device
+        self.half = half
         for image_dir, label_dir in (
             (self.dataset_dir / split / "images", self.dataset_dir / split / "labels"),
             (self.dataset_dir / "images" / split, self.dataset_dir / "labels" / split),
@@ -127,7 +129,12 @@ class Visualizer:
 
     def _predict(self, image):
         result = self.model.predict(
-            image, imgsz=self.imgsz, conf=self.conf, device=self.device, verbose=False
+            image,
+            imgsz=self.imgsz,
+            conf=self.conf,
+            device=self.device,
+            half=self.half,
+            verbose=False,
         )[0]
         boxes = result.boxes
         return [

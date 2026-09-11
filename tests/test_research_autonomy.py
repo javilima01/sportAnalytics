@@ -20,6 +20,20 @@ from src.research.label_review import review_labels
 from src.research.runtime import file_hash, read_json, save_json
 
 
+def fresh_checkpoint_worker(command, **kwargs):
+    """Like the real worker, each trial produces its own new checkpoint file."""
+    job = read_json(command[-1])
+    if job["kind"] == "diagnostic":
+        save_json(Path(job["folder"]) / "result.json", {"marker": "diagnostic evidence"})
+        return
+    checkpoint = Path(job["folder"]) / "weights" / "best.pt"
+    checkpoint.parent.mkdir(parents=True, exist_ok=True)
+    checkpoint.write_bytes(b"trained weights")
+    from test_research import good_metrics
+
+    save_json(Path(job["folder"]) / "metrics.json", good_metrics(checkpoint))
+
+
 def append_image(cfg, split, name="added", match="new-match", commit=True):
     image = cfg.dataset_dir / "images" / split / f"{name}.jpg"
     cv2.imwrite(str(image), np.full((64, 64, 3), 241, np.uint8))
@@ -60,7 +74,7 @@ def test_agent_extends_allowances_and_repeats_recipe_with_more_time(campaign):
             {"action": "stop"},
         ]
     )
-    result = run_autonomous(campaign, agent=agent, executor=worker)
+    result = run_autonomous(campaign, agent=agent, executor=fresh_checkpoint_worker)
     state = read_json(campaign.output_dir / "state.json")
     assert result["status"] == "stopped"
     assert [r["reserved_seconds"] for r in state["trials"]] == [900, 2700]
@@ -318,7 +332,7 @@ def test_long_trial_ceiling_rejection_and_registered_warm_start(campaign):
             {"action": "stop"},
         ]
     )
-    run_autonomous(campaign, agent=agent, executor=worker)
+    run_autonomous(campaign, agent=agent, executor=fresh_checkpoint_worker)
     assert agent.evidence[1]["previous_decisions"][-1]["action"] == "rejected"
     assert len(read_json(campaign.output_dir / "state.json")["trials"]) == 2
 
