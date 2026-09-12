@@ -346,7 +346,8 @@ class ResearchAgent:
         for index, (provider, client) in enumerate(self.routes):
             client.check_ready(Path(directory) / f"{index:02d}-{provider}")
 
-    def request(self, prompt, response_type, directory, *, images=(), timeout=None):
+    def _dispatch(self, directory, timeout, operation):
+        """Attempt each route in order, honoring cooldowns, and record the winning provider."""
         directory = Path(directory).resolve()
         directory.mkdir(parents=True, exist_ok=True)
         deadline = time.monotonic() + (
@@ -361,13 +362,7 @@ class ResearchAgent:
                 continue
             attempt = directory / f"{provider}-{len(list(directory.glob(provider + '-*'))) + 1:03d}"
             try:
-                result = client.request(
-                    prompt,
-                    response_type,
-                    attempt,
-                    images=images,
-                    timeout=deadline - time.monotonic(),
-                )
+                result = operation(client, attempt, deadline - time.monotonic())
             except QuotaExceeded as error:
                 interval = (
                     self.cfg.fallback.codex_retry_seconds
@@ -423,3 +418,19 @@ class ResearchAgent:
             )
             return result
         raise ProvidersUnavailable(wait_until if wait_until is not None else time.time() + 30)
+
+    def request(self, prompt, response_type, directory, *, images=(), timeout=None):
+        return self._dispatch(
+            directory,
+            timeout,
+            lambda client, attempt, remaining: client.request(
+                prompt, response_type, attempt, images=images, timeout=remaining
+            ),
+        )
+
+    def label(self, image, proposals, directory, timeout):
+        return self._dispatch(
+            directory,
+            timeout,
+            lambda client, attempt, remaining: client.label(image, proposals, attempt, remaining),
+        )
