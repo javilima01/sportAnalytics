@@ -38,6 +38,14 @@ class Client:
             raise value
         return value
 
+    def label(self, image, proposals, directory, timeout):
+        self.calls.append((image, directory, timeout))
+        directory.mkdir(parents=True, exist_ok=True)
+        value = next(self.replies)
+        if isinstance(value, Exception):
+            raise value
+        return value
+
 
 def accepted():
     return Review(status="accepted", reason="Verified empty image", boxes=[])
@@ -133,6 +141,20 @@ def test_disabled_fallback_waits_for_codex(cfg, tmp_path):
     router.routes = [("codex", Client([QuotaExceeded("codex")]))]
     with pytest.raises(ProvidersUnavailable):
         router.request("request", Review, tmp_path / "request")
+
+
+def test_label_routes_through_fallback_on_quota(cfg, tmp_path, monkeypatch):
+    monkeypatch.setattr("src.research.agent.time.time", lambda: 1000.0)
+    router = ResearchAgent(cfg)
+    codex = Client([QuotaExceeded("codex")])
+    muse = Client([accepted()])
+    router.routes = [("codex", codex), ("opencode", muse)]
+    image = tmp_path / "image.jpg"
+    result = router.label(image, [{"class": "ball"}], tmp_path / "label", 10)
+    assert result.status == "accepted"
+    assert len(codex.calls) == 1 and len(muse.calls) == 1
+    assert muse.calls[0][0] == image
+    assert read_json(tmp_path / "label/provider.json")["provider"] == "opencode"
 
 
 @pytest.mark.parametrize(
